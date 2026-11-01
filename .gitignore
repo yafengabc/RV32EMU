@@ -1,0 +1,38 @@
+# Binaries
+rv32emu.exe
+*.elf
+*.bin
+*.hex
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# TinyGo
+firmware/bench/bench
+firmware/bench/bench.elf
+firmware/bench/bench_qemu.elf
+firmware/bench/bench_js.go
+
+# Python
+__pycache__/
+*.pyc
+
+# Project artifacts
+fib.elf
+bench_pi.elf
+bench_sort.elf
+bench_sieve.elf
+c3demo.elf
+*.txt
+!README.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
