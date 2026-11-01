@@ -18,14 +18,44 @@ type CPU struct {
 	fw  func(addr uint32, size uint32, val uint32) // 快速写
 	csr *CSRFile
 
+	// priv 是当前特权级：3 = M-mode，0 = U-mode。
+	// RV32EMU 只模拟 M/U 两级；MPP 由 enterTrap 据此设置，
+	// mret 时据此恢复，使 ecall 能区分 U-mode(8) / M-mode(11)。
+	priv uint32
+
+	// pendingInt 是已挂起、等待 MIE 开时投递的中断 cause（含 IRQ 位）。
+	// 由外设（如 C3 定时器）通过 SetPendingInt 写入，每个周期由
+	// Step 在取指前采样。0 表示无挂起中断。
+	pendingInt uint32
+
+	// curPC 保存当前正在译码的指令地址，供 load/store/非法指令
+	// 构造异常 mepc（指向故障指令本身，而非已自增的 pc）。
+	curPC uint32
+
+	// pmpEnt 是 PMP 配置解析后的生效区间表（编号顺序，最小者优先）。
+	pmpEnt []pmpEntry
+	// pmpEnforce 关闭后 U-mode 不再受 PMP 约束（对照调试用，
+	// 用来区分「内核逻辑问题」和「PMP 建模问题」）。
+	pmpEnforce bool
+
+	// OnTrap 非空时，每次进入 trap 都会被回调（调试用）。
+	OnTrap func(cause, epc, tval uint32)
+
 	halted  bool
 	haltMsg string
+
+	// excCount 统计"同步异常"进入次数（不含中断），供调试器在第一次
+	// 真异常时停下；中断是正常路径，不应算作 fault。
+	excCount uint64
+
+	// intCount 统计中断进入次数（含 IRQ 位，不含同步异常）。
+	intCount uint64
 
 	instCount uint64
 }
 
 func New(bus mem.Bus) *CPU {
-	c := &CPU{bus: bus, csr: newCSRFile(), pc: ResetVector}
+	c := &CPU{bus: bus, csr: newCSRFile(), pc: ResetVector, priv: 3, pmpEnforce: true}
 	if sb, ok := bus.(*mem.SystemBus); ok {
 		c.fr = sb.FastRead
 		c.fw = sb.FastWrite
@@ -39,6 +69,8 @@ func New(bus mem.Bus) *CPU {
 func (c *CPU) Halted() bool  { return c.halted }
 func (c *CPU) HaltMsg() string { return c.haltMsg }
 func (c *CPU) PC() uint32     { return c.pc }
+func (c *CPU) ExcCount() uint64 { return c.excCount }
+func (c *CPU) IntCount() uint64 { return c.intCount }
 func (c *CPU) SetPC(p uint32) { c.pc = p }
 func (c *CPU) Reg(i int) uint32 {
 	if i == 0 {
@@ -53,7 +85,14 @@ func (c *CPU) SetReg(i int, v uint32) {
 }
 func (c *CPU) CSR() *CSRFile { return c.csr }
 
-// SetTimerPending 由外层（调度器/CLINT）回填 MTIP。
+// SetPMPEnforce 开关 U-mode 的 PMP 强制（对照调试用）。
+func (c *CPU) SetPMPEnforce(v bool) { c.pmpEnforce = v }
+
+// SetPendingInt 由外设写入一个挂起中断的 mcause（含 IRQ 位，如
+// C3 定时器上报 0x80000002）。Step 在取指前采样，MIE 开时投递。
+func (c *CPU) SetPendingInt(cause uint32) { c.pendingInt = cause }
+
+// SetTimerPending 兼容旧接口：仍回填 MTIP（无实际中断路径使用）。
 func (c *CPU) SetTimerPending(b bool) {
 	if b {
 		c.csr.mip |= mipMTIP
@@ -74,12 +113,14 @@ func (c *CPU) Step() bool {
 	if c.halted {
 		return false
 	}
-	// 热路径：仅在有未决中断且全局开中断时才做完整中断检查
-	if c.csr.mip != 0 && c.csr.mstatus&mstatusMIE != 0 {
+	// 取指前采样挂起中断：仅当 MIE 开时投递。中断的 mepc 指向
+	// 当前 pc（即被抢占的、尚未执行的指令），与 RISC-V 规范一致。
+	if c.pendingInt != 0 {
 		c.checkInterrupts()
 	}
 
 	curPC := c.pc
+	c.curPC = curPC
 	low := c.fr(c.pc, 2)
 	var instr uint32
 	var compressed bool
@@ -119,7 +160,13 @@ func (c *CPU) Run(max uint64) {
 
 func (c *CPU) load(addr uint32, size uint32, signed bool) uint32 {
 	if badAlign(addr, size) {
-		c.enterTrap(causeLoadMisalign, addr)
+		c.enterTrap(causeLoadMisalign, addr, c.curPC)
+		return 0
+	}
+	// U-mode 必须命中 PMP，否则是 load access fault（真机 C3 行为；
+	// 这也是 prot 用例里「越界读」被杀掉的机制）。
+	if !c.pmpCheck(addr, size, pmpRead) {
+		c.enterTrap(causeLoadFault, addr, c.curPC)
 		return 0
 	}
 	v := c.fr(addr, size)
@@ -136,7 +183,11 @@ func (c *CPU) load(addr uint32, size uint32, signed bool) uint32 {
 
 func (c *CPU) store(addr uint32, size uint32, val uint32) {
 	if badAlign(addr, size) {
-		c.enterTrap(causeStoreMisalign, addr)
+		c.enterTrap(causeStoreMisalign, addr, c.curPC)
+		return
+	}
+	if !c.pmpCheck(addr, size, pmpWrite) {
+		c.enterTrap(causeStoreFault, addr, c.curPC)
 		return
 	}
 	c.fw(addr, size, val)
@@ -161,7 +212,7 @@ func (c *CPU) Dump() string {
 			s += "\n"
 		}
 	}
-	s += fmt.Sprintf("pc = 0x%08X  mstatus=0x%08X  mtvec=0x%08X  mepc=0x%08X  mcause=0x%08X\n",
-		c.pc, c.csr.mstatus, c.csr.mtvec, c.csr.mepc, c.csr.mcause)
+	s += fmt.Sprintf("pc = 0x%08X  mstatus=0x%08X  mtvec=0x%08X  mepc=0x%08X  mcause=0x%08X  mtval=0x%08X\n",
+		c.pc, c.csr.mstatus, c.csr.mtvec, c.csr.mepc, c.csr.mcause, c.csr.mtval)
 	return s
 }

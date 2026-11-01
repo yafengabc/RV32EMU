@@ -220,16 +220,24 @@ func (c *CPU) execSystem(instr, curPC uint32) {
 	csr := (instr >> 20) & 0xfff
 
 	switch f3 {
-	case 0: // ECALL / EBREAK
+	case 0: // ECALL / EBREAK / MRET / WFI
 		switch csr {
 		case 0x0: // ECALL
-			// 对齐 ESP-IDF：进入 M 环境调用异常，由模拟器/RTOS 向量处理。
-			c.enterTrap(causeEcallM, 0)
+			// 按当前特权级区分：U-mode 用户态系统调用(cause 8)，
+			// M-mode 内核自身调用(cause 11)。mepc 指向 ecall
+			// 指令本身，内核 trap_handler 会 +4 跳过它。
+			if c.priv == 0 {
+				c.enterTrap(causeEcallU, 0, c.curPC)
+			} else {
+				c.enterTrap(causeEcallM, 0, c.curPC)
+			}
 		case 0x1: // EBREAK —— 模拟器约定：停机，作为固件 exit
 			c.halted = true
 			c.haltMsg = "EBREAK"
 		case 0x302: // MRET
 			c.mret()
+		case 0x105: // WFI —— C3 无独立休眠；视作空操作，下一个 tick
+			// 仍由 checkInterrupts 正常投递（MIE 开时）。
 		default:
 			c.illegal(instr)
 		}
@@ -287,7 +295,7 @@ func (c *CPU) execSystem(instr, curPC uint32) {
 }
 
 func (c *CPU) illegal(instr uint32) {
-	c.enterTrap(causeIllegalInstr, instr)
+	c.enterTrap(causeIllegalInstr, instr, c.curPC)
 }
 
 func boolToU32(b bool) uint32 {
