@@ -85,6 +85,15 @@ func (u *UART) startRX(src io.Reader) {
 
 func (u *UART) Name() string { return "UART0" }
 
+// Reset 模拟芯片复位：RX FIFO 清空，但主机侧尚未送进 FIFO 的字节保留
+// （rxIn 建模的是主机那一端，复位不会把已经在路上的字符收回去）。
+// 内核复位后重新打开 UART 中断时，这些字节会照常被搬进新的 FIFO。
+func (u *UART) Reset() {
+	u.mu.Lock()
+	u.rxBuf.Reset()
+	u.mu.Unlock()
+}
+
 // RxFeed 把最多 limit 个字节从输入缓冲搬进 RX FIFO（不超过硬件深度）。
 //
 // 必须节流，不能一次把 stdin 全倒进 FIFO：内核的行规程只有 8 行队列，

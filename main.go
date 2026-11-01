@@ -18,51 +18,85 @@ const (
 	defaultELF     = `C:\Users\SONG\Documents\Projects\TinyOS\build\kernel-esp32c3.elf`
 	defaultRamdisk = `C:\Users\SONG\Documents\Projects\TinyOS\build\ramdisk-esp32c3.bin`
 	flashOffset    = 0x100000 // littlefs 分区在 flash 偏移 0x100000
+	flashSize      = 0x400000 // 4 MiB，与芯片一致
+)
+
+var (
+	elfPath   = flag.String("elf", defaultELF, "ELF firmware to load (ESP-IDF .elf)")
+	binPath   = flag.String("bin", "", "raw .bin to load")
+	entry     = flag.Uint("entry", 0x40000000, "entry/load base when using -bin")
+	ramdisk   = flag.String("ramdisk", defaultRamdisk, "littlefs ramdisk image (flash partition)")
+	max       = flag.Uint64("max", 0, "max instructions (0=until halt)")
+	trace     = flag.Bool("trace", false, "print each executed instruction (pc + disasm)")
+	traceFrom = flag.Uint64("tracefrom", 0, "only trace after this instruction index")
+	traceTo   = flag.Uint64("traceto", 0, "stop tracing at this instruction index (0=no limit)")
+	fault     = flag.Bool("fault", false, "stop at first trap and dump the last 48 instructions")
+	watch     = flag.Int("watch", -1, "watch a register index: print each change (pc, old->new)")
+	traceIrq  = flag.Int("traceirq", -1, "arm tracing at this interrupt number (1-based)")
+	traceIrqN = flag.Int("traceirqn", 200, "how many instructions to trace once armed")
+	rxRate    = flag.Int("rxrate", 16, "console input bytes released per feed (0 = no throttling)")
+	rxPeriod  = flag.Uint64("rxperiod", 10000, "instructions between console input feeds (10000 = one timer tick)")
+	rxDelay   = flag.Uint64("rxdelay", 0, "hold console input for the first N instructions (scripting: 3000000 ≈ after boot)")
+	noPMP     = flag.Bool("nopmp", false, "disable PMP enforcement for user mode (A/B debugging)")
+	trapLog   = flag.Bool("traplog", false, "log every synchronous trap (cause, mepc, mtval)")
+	breakPC   = flag.Uint64("breakpc", 0, "stop when pc equals this address (0 = off)")
+	tickDiv   = flag.Uint("tickdiv", 1, "stretch the timer period by this factor (timing-sensitivity tests)")
+	step      = flag.Int("step", 0, "execute N instructions then pause & dump regs")
+	dumpRAM   = flag.String("dumpram", "", "write kernel RAM image (0x40380000..0x403AC000) to this file at exit")
 )
 
 func main() {
-	elfPath := flag.String("elf", defaultELF, "ELF firmware to load (ESP-IDF .elf)")
-	binPath := flag.String("bin", "", "raw .bin to load")
-	entry := flag.Uint("entry", 0x40000000, "entry/load base when using -bin")
-	ramdisk := flag.String("ramdisk", defaultRamdisk, "littlefs ramdisk image (flash partition)")
-	max := flag.Uint64("max", 0, "max instructions (0=until halt)")
-	trace := flag.Bool("trace", false, "print each executed instruction (pc + disasm)")
-	traceFrom := flag.Uint64("tracefrom", 0, "only trace after this instruction index")
-	traceTo := flag.Uint64("traceto", 0, "stop tracing at this instruction index (0=no limit)")
-	fault := flag.Bool("fault", false, "stop at first trap and dump the last 48 instructions")
-	watch := flag.Int("watch", -1, "watch a register index: print each change (pc, old->new)")
-	traceIrq := flag.Int("traceirq", -1, "arm tracing at this interrupt number (1-based)")
-	traceIrqN := flag.Int("traceirqn", 200, "how many instructions to trace once armed")
-	rxRate := flag.Int("rxrate", 16, "console input bytes released per feed (0 = no throttling)")
-	rxPeriod := flag.Uint64("rxperiod", 10000, "instructions between console input feeds (10000 = one timer tick)")
-	rxDelay := flag.Uint64("rxdelay", 0, "hold console input for the first N instructions (scripting: 3000000 ≈ after boot)")
-	noPMP := flag.Bool("nopmp", false, "disable PMP enforcement for user mode (A/B debugging)")
-	trapLog := flag.Bool("traplog", false, "log every synchronous trap (cause, mepc, mtval)")
-	breakPC := flag.Uint64("breakpc", 0, "stop when pc equals this address (0 = off)")
-	tickDiv := flag.Uint("tickdiv", 1, "stretch the timer period by this factor (timing-sensitivity tests)")
-	step := flag.Int("step", 0, "execute N instructions then pause & dump regs")
-	dumpRAM := flag.String("dumpram", "", "write kernel RAM image (0x40380000..0x403AC000) to this file at exit")
 	flag.Parse()
 
-	bus := mem.NewSystemBus()
+	ramdiskImg, err := os.ReadFile(*ramdisk)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load ramdisk: %v\n", err)
+		os.Exit(1)
+	}
+
+	// flash 是复位后唯一留下来的东西（真机上 SPI flash 的字节不会因为
+	// 复位而消失，`wfile` 写进去的文件重启后还在），所以在机器之外持有。
+	flash := make([]byte, flashSize)
+	copy(flash[flashOffset:], ramdiskImg)
+
+	// UART 同理活过一次复位：它建模的是主机那一端（stdin 搬运协程、
+	// 尚未送进 FIFO 的字节）。芯片侧的 FIFO 在 machine 复位时清空。
 	uart := perip.NewUART0()
+
+	fmt.Printf("[flash] ramdisk %d bytes @0x%08X\n", len(ramdiskImg), perip.FlashEmuBase+flashOffset)
+	for boot := 1; ; boot++ {
+		m := newMachine(flash, uart)
+		if !m.run() {
+			break
+		}
+		flash = m.flashSnapshot()
+		fmt.Printf("=== rebooting (boot #%d) ===\n", boot+1)
+	}
+}
+
+// machine 是一台「通电」的 C3：总线、CPU、外设。复位 = 重装一台新的，
+// 只有 flash 内容和主机侧的控制台输入从上一次带过来。
+type machine struct {
+	bus   *mem.SystemBus
+	cpu   *cpu.CPU
+	uart  *perip.UART
+	rtc   *perip.RTC
+	timer *perip.C3Timer
+}
+
+func newMachine(flash []byte, uart *perip.UART) *machine {
+	bus := mem.NewSystemBus()
 	gpio := perip.NewGPIO()
 	usj := perip.NewUSJ()
+	rtc := perip.NewRTC()
 	bus.Attach(mem.DeviceRange{Base: perip.UART0Base, Size: perip.UARTSize, Dev: uart})
 	bus.Attach(mem.DeviceRange{Base: perip.GPIOBase, Size: perip.GPIOSize, Dev: gpio})
 	bus.Attach(mem.DeviceRange{Base: perip.USJBase, Size: perip.USJSize, Dev: usj})
-	bus.Attach(mem.DeviceRange{Base: perip.RTCBase, Size: perip.RTCSize, Dev: perip.NewRTC()})
+	bus.Attach(mem.DeviceRange{Base: perip.RTCBase, Size: perip.RTCSize, Dev: rtc})
 
 	// flash 模拟区：ROM 桩把 (FlashEmuBase + flash_addr) 当物理 flash。
-	flashSize := uint32(0x400000) // 4 MiB，与芯片一致
 	bus.AddRAM(perip.FlashEmuBase, flashSize)
-	if rd, err := os.ReadFile(*ramdisk); err != nil {
-		fmt.Fprintf(os.Stderr, "load ramdisk: %v\n", err)
-		os.Exit(1)
-	} else {
-		bus.CopyInto(perip.FlashEmuBase, flashOffset, rd)
-		fmt.Printf("[flash] ramdisk %d bytes @0x%08X\n", len(rd), perip.FlashEmuBase+flashOffset)
-	}
+	bus.CopyInto(perip.FlashEmuBase, 0, flash)
 
 	// ROM 桩：实现 esp_rom_spiflash_read/write/config_param。
 	bus.LoadROM(0, rom.BuildROM())
@@ -110,6 +144,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	return &machine{bus: bus, cpu: c, uart: uart, rtc: rtc, timer: c3timer}
+}
+
+// flashSnapshot 取回 flash 模拟区的当前内容，供复位后灌进新总线。
+func (m *machine) flashSnapshot() []byte {
+	buf := make([]byte, flashSize)
+	m.bus.CopyOut(perip.FlashEmuBase, buf)
+	return buf
+}
+
+// run 执行到停机、指令上限或一次软件复位。返回 true 表示内核请求了复位
+// （RTC_CNTL SW_SYS_RST），调用方应当重装机器。
+func (m *machine) run() bool {
+	c := m.cpu
+
 	limit := *max
 	if *step > 0 {
 		limit = uint64(*step)
@@ -148,9 +197,9 @@ func main() {
 			}
 		}
 		if *trace || (*traceFrom > 0 && n >= *traceFrom && (*traceTo == 0 || n < *traceTo)) {
-			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, bus))
+			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, m.bus))
 		} else if irqBudget > 0 {
-			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, bus))
+			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, m.bus))
 			irqBudget--
 		}
 		if *fault {
@@ -159,13 +208,8 @@ func main() {
 		if *breakPC != 0 && uint64(c.PC()) == *breakPC {
 			fmt.Printf("\n=== break at pc=0x%08X (inst %d) ===\n", c.PC(), n)
 			fmt.Print(c.Dump())
-			if *dumpRAM != "" {
-				buf := make([]byte, 0x2C000)
-				bus.CopyOut(0x40380000, buf)
-				_ = os.WriteFile(*dumpRAM, buf, 0o644)
-				fmt.Printf("=== ram dump -> %s ===\n", *dumpRAM)
-			}
-			return
+			m.writeRAMDump()
+			return false
 		}
 		excBefore := c.ExcCount()
 		var ran uint64
@@ -182,7 +226,7 @@ func main() {
 			c.Step()
 			if c.Reg(*watch) != oldv {
 				fmt.Printf("[%6d] pc=0x%08X  x%d: 0x%08X -> 0x%08X  %s\n",
-					n, oldpc, *watch, oldv, c.Reg(*watch), disasmAtPC(oldpc, bus))
+					n, oldpc, *watch, oldv, c.Reg(*watch), disasmAtPC(oldpc, m.bus))
 			}
 			ran = 1
 		default:
@@ -192,7 +236,7 @@ func main() {
 		if ran == 0 {
 			break
 		}
-		c3timer.TickN(ran)
+		m.timer.TickN(ran)
 		// 控制台输入按 tick 分批放行（见 UART.RxFeed 的注释）。
 		// -rxdelay 让脚本输入等 shell 起来再喂：内核行规程只有 8 行队
 		// 列，boot 期间灌进去的预输入超过 8 行就会按设计丢行。
@@ -205,10 +249,18 @@ func main() {
 			// 原本是"指令序号 n 为 p 的倍数时放行一次"；批量执行时
 			// 把本批覆盖到的所有放行点一次补齐。
 			for k := (n + p - 1) / p; k <= (n+ran-1)/p; k++ {
-				uart.RxFeed(*rxRate)
+				m.uart.RxFeed(*rxRate)
 			}
 		}
 		n += ran
+		// 软件复位：内核写完 RTC_CNTL 就会一直自旋等到复位生效，模拟器
+		// 这边没有比「重装一台机器」更准确的做法。批量执行只影响
+		// 这一步晚几条指令被发现，内核在自旋里等，无所谓。
+		if m.rtc.ResetPending() {
+			fmt.Printf("\n=== software reset after %d inst (RTC_CNTL SW_SYS_RST) ===\n", n)
+			m.uart.Reset()
+			return true
+		}
 		if *fault && c.ExcCount() > excBefore {
 			fmt.Printf("\n=== first fault @ inst %d, mcause=0x%08X ===\n", n, c.CSR().Mcause())
 			start := uint64(0)
@@ -218,30 +270,37 @@ func main() {
 			for k := start; k < n; k++ {
 				e := ring[k%48]
 				if e.pc != 0 {
-					fmt.Printf("[%6d] pc=0x%08X  %s\n", e.n, e.pc, disasmAtPC(e.pc, bus))
+					fmt.Printf("[%6d] pc=0x%08X  %s\n", e.n, e.pc, disasmAtPC(e.pc, m.bus))
 				}
 			}
 			fmt.Print(c.Dump())
-			return
+			return false
 		}
 	}
 
 	fmt.Printf("\n=== stopped after %d inst, reason=%q ===\n", n, c.HaltMsg())
 	fmt.Printf("=== irq: timg0 fires=%d, cpu interrupts=%d, exceptions=%d ===\n",
-		c3timer.Fires(), c.IntCount(), c.ExcCount())
-	if *dumpRAM != "" {
-		const dumpBase, dumpLen = 0x40380000, 0x2C000
-		buf := make([]byte, dumpLen)
-		bus.CopyOut(dumpBase, buf)
-		if err := os.WriteFile(*dumpRAM, buf, 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "dumpram: %v\n", err)
-		} else {
-			fmt.Printf("=== ram dump %d bytes @0x%08X -> %s ===\n", dumpLen, dumpBase, *dumpRAM)
-		}
-	}
+		m.timer.Fires(), c.IntCount(), c.ExcCount())
+	m.writeRAMDump()
 	if *step > 0 || c.Halted() {
 		fmt.Print(c.Dump())
 	}
+	return false
+}
+
+// writeRAMDump 在 -dumpram 下把内核 RAM 落盘（调试用）。
+func (m *machine) writeRAMDump() {
+	if *dumpRAM == "" {
+		return
+	}
+	const dumpBase, dumpLen = 0x40380000, 0x2C000
+	buf := make([]byte, dumpLen)
+	m.bus.CopyOut(dumpBase, buf)
+	if err := os.WriteFile(*dumpRAM, buf, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "dumpram: %v\n", err)
+		return
+	}
+	fmt.Printf("=== ram dump %d bytes @0x%08X -> %s ===\n", dumpLen, dumpBase, *dumpRAM)
 }
 
 // disasmAt 读当前 pc 处指令并反汇编。

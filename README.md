@@ -107,6 +107,12 @@ CLI 参数（常用的）：
 - PMP：U-mode 必须命中允许的条目，否则 load/store access fault；M-mode 放行
   （内核从不设锁定位）。区间在 `pmpcfg/pmpaddr` 写入后惰性重建。
 - ebreak 在本模拟器约定为**停机**（作为固件退出）。
+- **软件复位**：内核 `reboot` 写 `RTC_CNTL_OPTIONS0` 的 `SW_SYS_RST`(bit31) 时，
+  模拟器把整台机器重装一遍——SRAM、外设寄存器、CPU 全部回到复位状态，只有
+  SPI flash 的内容（`wfile` 写进去的东西）和主机侧尚未送达的控制台输入留下。
+  这跟真机一致：C3 复位后 ROM 报 `rst:0x3 RTC_SW_SYS_RST`，随后从 flash 重新启动。
+  脚本里连着喂 `reboot` 之后的命令会丢一部分字节（复位瞬间内核行规程里预输入
+  的那些行跟着机器一起没了），这是真机行为，不是模拟器的毛病。
 
 ## 跑 TinyOS 的验收结果
 
@@ -120,6 +126,7 @@ CLI 参数（常用的）：
 - `crash`：非法指令只杀该进程，shell 存活
 - `run spin &`：后台任务按 50 ms 时间片被抢占，前台 shell 仍可用
 - `prot rodata|heap|stack|null`：四条越界全部按真机语义 fault 并杀掉任务
+- `reboot`：软件复位 → 第二次 boot 到 `tos>`，flash 里的文件还在
 
 ## 自测
 
