@@ -7,18 +7,33 @@ import (
 
 // ESP32-C3 地址映射（摘自技术参考手册 Memory Map 章节）。
 const (
-	ROMBase    uint32 = 0x40000000
-	ROMSize    uint32 = 512 * 1024 // 0x40000000~0x4007FFFF
-	SRAMBase   uint32 = 0x3FC80000
-	SRAMSize   uint32 = 512 * 1024 // 0x3FC80000~0x3FCFFFFF
+	ROMBase  uint32 = 0x40000000
+	ROMSize  uint32 = 512 * 1024 // 0x40000000~0x4007FFFF
+	SRAMBase uint32 = 0x3FC80000
+	SRAMSize uint32 = 512 * 1024 // 0x3FC80000~0x3FCFFFFF
+
+	// FlatBase/FlatSize 是「一次性边界检查」用的连续平铺区：
+	// 把 flash 模拟区、SRAM、ROM、IRAM/内核 RAM 装进同一块切片，
+	// 地址 → 索引只是一次减法。CPU 取指和访存因此省掉
+	// fastSlice 的区间串比较和函数调用间接跳转。
+	//
+	// 覆盖范围 0x3F000000~0x40FFFFFF（32MiB，零填充页由 OS 惰性分配），
+	// 含 flash 模拟区(4MiB)、SRAM(512KiB)、ROM(512KiB)、
+	// IRAM/内核 RAM(0x4037C000 起) 以及 ELF 加载器 1MiB 最小分配余量。
+	// 所有 MMIO 外设都在 0x60000000 以上，不会落在平铺区里。
+	FlatBase uint32 = 0x3F000000
+	FlatSize uint32 = 32 * 1024 * 1024
 )
 
 // SystemBus 实现 Bus：ROM + SRAM + 挂载的 MMIO 外设 + 动态 RAM 区。
 type SystemBus struct {
-	rom   []byte
-	sram  []byte
-	devs  []DeviceRange
-	rams  []ramRegion
+	// flat 是上述平铺区；rom/sram 以及落在区内的动态 RAM 都是它的视图，
+	// 保证「直访切片」和「走总线」读到的是同一份字节。
+	flat []byte
+	rom  []byte
+	sram []byte
+	devs []DeviceRange
+	rams []ramRegion
 	// 未映射访问按地址去重上报：只报一次全局会把后面真正的外设缺口
 	// 全部吞掉（曾因此漏掉 RTC_CNTL），逐个地址报又会被循环刷屏。
 	unmappedR map[uint32]bool
@@ -34,16 +49,27 @@ type ramRegion struct {
 }
 
 func NewSystemBus() *SystemBus {
-	return &SystemBus{
-		rom:       make([]byte, ROMSize),
-		sram:      make([]byte, SRAMSize),
+	b := &SystemBus{
+		flat:      make([]byte, FlatSize),
 		unmappedR: make(map[uint32]bool),
 		unmappedW: make(map[uint32]bool),
 	}
+	b.rom = b.flat[ROMBase-FlatBase : ROMBase-FlatBase+ROMSize]
+	b.sram = b.flat[SRAMBase-FlatBase : SRAMBase-FlatBase+SRAMSize]
+	return b
 }
 
+// FlatSlice 返回平铺区，供 CPU 做「地址减基址」式直访。
+func (b *SystemBus) FlatSlice() []byte { return b.flat }
+
 // AddRAM 动态挂一段 RAM（供 ELF 加载器为未映射段自动分配）。
+// 落在平铺区内的段直接切平铺区的视图，避免出现「总线写一份、
+// CPU 直访读到另一份」的分裂。
 func (b *SystemBus) AddRAM(base uint32, size uint32) {
+	if off := base - FlatBase; off < FlatSize && size <= FlatSize-off {
+		b.rams = append(b.rams, ramRegion{base: base, data: b.flat[off : off+size]})
+		return
+	}
 	b.rams = append(b.rams, ramRegion{base: base, data: make([]byte, size)})
 }
 
@@ -215,58 +241,86 @@ func (b *SystemBus) CopyOut(base uint32, dst []byte) {
 	}
 }
 
-// 在 RAM/ROM 区间内返回切片（快速路径），否则返回 nil。
-func (b *SystemBus) fastSlice(addr uint32) []byte {
-	switch {
-	case in(addr, ROMBase, ROMSize):
-		return b.rom[addr-ROMBase:]
-	case in(addr, SRAMBase, SRAMSize):
-		return b.sram[addr-SRAMBase:]
-	}
-	for _, r := range b.rams {
-		if in(addr, r.base, uint32(len(r.data))) {
-			return r.data[addr-r.base:]
+// ramAt 返回 addr 所在动态 RAM 区及其区内偏移，未命中 ok=false。
+// 只查平铺区之外的区：区内 RAM 已由平铺区覆盖，不会走到这里。
+func (b *SystemBus) ramAt(addr uint32, size uint32) (*ramRegion, uint32, bool) {
+	for i := range b.rams {
+		r := &b.rams[i]
+		if off := addr - r.base; off < uint32(len(r.data)) && size <= uint32(len(r.data))-off {
+			return r, off, true
 		}
 	}
-	return nil
+	return nil, 0, false
 }
 
-// FastRead 热路径读：ROM/SRAM 直接索引，外设回落到通用 Read。
+// FastRead 热路径读：平铺区内一次边界检查直接索引；
+// 区外的动态 RAM（如 ELF 加载器为 0x80000000 这类非 C3 地址分配的段）
+// 仍按区直接索引；其余（MMIO 外设、未映射）回落通用 Read。
 func (b *SystemBus) FastRead(addr uint32, size uint32) uint32 {
-	s := b.fastSlice(addr)
-	if s == nil {
-		return b.Read(addr, size)
+	if off := addr - FlatBase; off < FlatSize-size+1 {
+		switch size {
+		case 1:
+			return uint32(b.flat[off])
+		case 2:
+			return uint32(b.flat[off]) | uint32(b.flat[off+1])<<8
+		case 4:
+			return uint32(b.flat[off]) | uint32(b.flat[off+1])<<8 |
+				uint32(b.flat[off+2])<<16 | uint32(b.flat[off+3])<<24
+		}
+		panic("bad size")
 	}
-	switch size {
-	case 1:
-		return uint32(s[0])
-	case 2:
-		return uint32(s[0]) | uint32(s[1])<<8
-	case 4:
-		return uint32(s[0]) | uint32(s[1])<<8 | uint32(s[2])<<16 | uint32(s[3])<<24
+	if r, off, ok := b.ramAt(addr, size); ok {
+		switch size {
+		case 1:
+			return uint32(r.data[off])
+		case 2:
+			return uint32(r.data[off]) | uint32(r.data[off+1])<<8
+		case 4:
+			return uint32(r.data[off]) | uint32(r.data[off+1])<<8 |
+				uint32(r.data[off+2])<<16 | uint32(r.data[off+3])<<24
+		}
+		panic("bad size")
 	}
-	panic("bad size")
+	return b.Read(addr, size)
 }
 
 // FastWrite 热路径写。
 func (b *SystemBus) FastWrite(addr uint32, size uint32, val uint32) {
-	s := b.fastSlice(addr)
-	if s == nil {
-		b.Write(addr, size, val)
+	if off := addr - FlatBase; off < FlatSize-size+1 {
+		switch size {
+		case 1:
+			b.flat[off] = uint8(val)
+		case 2:
+			b.flat[off] = uint8(val)
+			b.flat[off+1] = uint8(val >> 8)
+		case 4:
+			b.flat[off] = uint8(val)
+			b.flat[off+1] = uint8(val >> 8)
+			b.flat[off+2] = uint8(val >> 16)
+			b.flat[off+3] = uint8(val >> 24)
+		default:
+			panic("bad size")
+		}
 		return
 	}
-	switch size {
-	case 1:
-		s[0] = uint8(val)
-	case 2:
-		s[0] = uint8(val)
-		s[1] = uint8(val >> 8)
-	case 4:
-		s[0] = uint8(val)
-		s[1] = uint8(val >> 8)
-		s[2] = uint8(val >> 16)
-		s[3] = uint8(val >> 24)
+	if r, off, ok := b.ramAt(addr, size); ok {
+		switch size {
+		case 1:
+			r.data[off] = uint8(val)
+		case 2:
+			r.data[off] = uint8(val)
+			r.data[off+1] = uint8(val >> 8)
+		case 4:
+			r.data[off] = uint8(val)
+			r.data[off+1] = uint8(val >> 8)
+			r.data[off+2] = uint8(val >> 16)
+			r.data[off+3] = uint8(val >> 24)
+		default:
+			panic("bad size")
+		}
+		return
 	}
+	b.Write(addr, size, val)
 }
 
 func in(addr, base, size uint32) bool {

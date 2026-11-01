@@ -70,18 +70,41 @@ func (t *C3Timer) SetCPU(c *cpu.CPU) { t.cpu = c }
 // Tick 每个 CPU 周期调用一次：计数达到 reload 则上报一次 tick 中断。
 // 内核在 ISR 里清 INTMTX 并 re-arm T0，但我们的模型里定时器按周期
 // 持续触发即可——pendingInt 每次被 CPU 取走后置 0，下一周期再置位。
-func (t *C3Timer) Tick() {
+func (t *C3Timer) Tick() { t.TickN(1) }
+
+// TickN 一次推进 n 个周期，供 CPU 批量执行（RunHot）后补计时。
+// 语义与连续调用 n 次 Tick 等价，只是把中间的分频/重载合并计算；
+// 内部只用减法循环（触发次数不会很多），避免每条指令一次 64 位除法。
+func (t *C3Timer) TickN(n uint64) {
+	if n == 0 {
+		return
+	}
 	if t.div > 1 {
-		t.sub++
-		if t.sub < t.div {
+		total := uint64(t.sub) + n
+		n = total / uint64(t.div)
+		t.sub = uint32(total % uint64(t.div))
+		if n == 0 {
 			return
 		}
-		t.sub = 0
 	}
-	t.counter++
-	if t.counter >= uint64(t.reload) {
+	if t.reload == 0 { // 未设置报警值：按原语义每周期都触发
+		t.fires += n
+		t.cpu.SetPendingInt(c3TickCause)
+		return
+	}
+	fires := uint64(0)
+	for n > 0 {
+		remaining := uint64(t.reload) - t.counter
+		if n < remaining {
+			t.counter += n
+			break
+		}
+		n -= remaining
 		t.counter = 0
-		t.fires++
+		fires++
+	}
+	if fires > 0 {
+		t.fires += fires
 		t.cpu.SetPendingInt(c3TickCause)
 	}
 }
@@ -106,10 +129,10 @@ const (
 )
 
 const (
-	t0En       uint32 = 1 << 31
-	t0AlarmEn  uint32 = 1 << 10
-	t0DivS     uint32 = 13
-	t0DivM     uint32 = 0xFFFF
+	t0En      uint32 = 1 << 31
+	t0AlarmEn uint32 = 1 << 10
+	t0DivS    uint32 = 13
+	t0DivM    uint32 = 0xFFFF
 )
 
 func (t *C3Timer) Read(offset uint32, size uint32) uint32 {
@@ -183,10 +206,10 @@ func NewC3SPI1(b *mem.SystemBus, flashBase uint32) *C3SPI1 {
 func (s *C3SPI1) Name() string { return "C3SPI1" }
 
 const (
-	spi1CmdReg     uint32 = 0x00
-	spi1AddrReg    uint32 = 0x04
-	spi1CmdWren    uint32 = 1 << 30
-	spi1CmdSe      uint32 = 1 << 24
+	spi1CmdReg  uint32 = 0x00
+	spi1AddrReg uint32 = 0x04
+	spi1CmdWren uint32 = 1 << 30
+	spi1CmdSe   uint32 = 1 << 24
 )
 
 func (s *C3SPI1) Read(offset uint32, size uint32) uint32 {

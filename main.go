@@ -115,6 +115,12 @@ func main() {
 		limit = uint64(*step)
 	}
 
+	// bulk：没有任何逐条插桩时，用 RunHot 批量执行（快路径）。
+	// trace/watch/fault/breakpc/traceirq 都依赖每条指令前的 PC 与状态，只能单步。
+	bulk := !*trace && *traceFrom == 0 && *step == 0 && *watch < 0 &&
+		!*fault && *breakPC == 0 && *traceIrq < 0
+	const hotBatch = 1000 // 与默认 tick(rxperiod) 同量级，减少批边界相对误差
+
 	fmt.Printf("=== RV32EMU start pc=0x%08X ===\n", c.PC())
 	n := uint64(0)
 	type ringEnt struct {
@@ -162,7 +168,15 @@ func main() {
 			return
 		}
 		excBefore := c.ExcCount()
-		if *watch >= 0 {
+		var ran uint64
+		switch {
+		case bulk:
+			b := uint64(hotBatch)
+			if limit != 0 && limit-n < b {
+				b = limit - n
+			}
+			ran = c.RunHot(b)
+		case *watch >= 0:
 			oldv := c.Reg(*watch)
 			oldpc := c.PC()
 			c.Step()
@@ -170,23 +184,31 @@ func main() {
 				fmt.Printf("[%6d] pc=0x%08X  x%d: 0x%08X -> 0x%08X  %s\n",
 					n, oldpc, *watch, oldv, c.Reg(*watch), disasmAtPC(oldpc, bus))
 			}
-		} else {
+			ran = 1
+		default:
 			c.Step()
+			ran = 1
 		}
-		c3timer.Tick()
+		if ran == 0 {
+			break
+		}
+		c3timer.TickN(ran)
 		// 控制台输入按 tick 分批放行（见 UART.RxFeed 的注释）。
 		// -rxdelay 让脚本输入等 shell 起来再喂：内核行规程只有 8 行队
 		// 列，boot 期间灌进去的预输入超过 8 行就会按设计丢行。
+		// 说明：批量执行时一次补齐本批跨过的所有放行点。
 		if *rxRate > 0 && n >= *rxDelay {
 			p := *rxPeriod
 			if p == 0 {
 				p = 1
 			}
-			if n%p == 0 {
+			// 原本是"指令序号 n 为 p 的倍数时放行一次"；批量执行时
+			// 把本批覆盖到的所有放行点一次补齐。
+			for k := (n + p - 1) / p; k <= (n+ran-1)/p; k++ {
 				uart.RxFeed(*rxRate)
 			}
 		}
-		n++
+		n += ran
 		if *fault && c.ExcCount() > excBefore {
 			fmt.Printf("\n=== first fault @ inst %d, mcause=0x%08X ===\n", n, c.CSR().Mcause())
 			start := uint64(0)
