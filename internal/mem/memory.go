@@ -15,12 +15,18 @@ const (
 
 // SystemBus 实现 Bus：ROM + SRAM + 挂载的 MMIO 外设 + 动态 RAM 区。
 type SystemBus struct {
-	rom           []byte
-	sram          []byte
-	devs          []DeviceRange
-	rams          []ramRegion
-	unmappedWarned bool
+	rom   []byte
+	sram  []byte
+	devs  []DeviceRange
+	rams  []ramRegion
+	// 未映射访问按地址去重上报：只报一次全局会把后面真正的外设缺口
+	// 全部吞掉（曾因此漏掉 RTC_CNTL），逐个地址报又会被循环刷屏。
+	unmappedR map[uint32]bool
+	unmappedW map[uint32]bool
 }
+
+// unmappedWarnLimit 每个方向最多报这么多个不同地址。
+const unmappedWarnLimit = 12
 
 type ramRegion struct {
 	base uint32
@@ -29,8 +35,10 @@ type ramRegion struct {
 
 func NewSystemBus() *SystemBus {
 	return &SystemBus{
-		rom:  make([]byte, ROMSize),
-		sram: make([]byte, SRAMSize),
+		rom:       make([]byte, ROMSize),
+		sram:      make([]byte, SRAMSize),
+		unmappedR: make(map[uint32]bool),
+		unmappedW: make(map[uint32]bool),
 	}
 }
 
@@ -88,10 +96,10 @@ func (b *SystemBus) readRaw(addr uint32) uint8 {
 			}
 		}
 	}
-	// 未映射地址读为 0（告警只打一次，避免 I/O 拖慢性能）
-	if !b.unmappedWarned {
+	// 未映射地址读为 0
+	if !b.unmappedR[addr] && len(b.unmappedR) < unmappedWarnLimit {
+		b.unmappedR[addr] = true
 		fmt.Printf("[bus] unmapped read @0x%08X\n", addr)
-		b.unmappedWarned = true
 	}
 	return 0
 }
@@ -115,15 +123,31 @@ func (b *SystemBus) writeRaw(addr uint32, v uint8) {
 				return
 			}
 		}
-		if !b.unmappedWarned {
+		if !b.unmappedW[addr] && len(b.unmappedW) < unmappedWarnLimit {
+			b.unmappedW[addr] = true
 			fmt.Printf("[bus] unmapped write @0x%08X = 0x%02X\n", addr, v)
-			b.unmappedWarned = true
 		}
 	}
 }
 
+// devAt 返回 addr 所在外设，未命中返回 nil。
+// 外设必须整体访问（一次 Read/Write 带 size），不能按字节拆：
+// 拆开会让 sw 变成 4 次字节写，寄存器语义全错（TIMG0 就踩过这个坑），
+// 4 字节读 UART FIFO 还会一次吃掉 4 个字符。
+func (b *SystemBus) devAt(addr uint32) *DeviceRange {
+	for i := range b.devs {
+		if in(addr, b.devs[i].Base, b.devs[i].Size) {
+			return &b.devs[i]
+		}
+	}
+	return nil
+}
+
 // Read 按 size(1/2/4) 小端读。
 func (b *SystemBus) Read(addr uint32, size uint32) uint32 {
+	if d := b.devAt(addr); d != nil {
+		return d.Dev.Read(addr-d.Base, size)
+	}
 	switch size {
 	case 1:
 		return uint32(b.readRaw(addr))
@@ -143,6 +167,10 @@ func (b *SystemBus) Read(addr uint32, size uint32) uint32 {
 
 // Write 按 size(1/2/4) 小端写。
 func (b *SystemBus) Write(addr uint32, size uint32, val uint32) {
+	if d := b.devAt(addr); d != nil {
+		d.Dev.Write(addr-d.Base, size, val)
+		return
+	}
 	switch size {
 	case 1:
 		b.writeRaw(addr, uint8(val))
@@ -161,6 +189,30 @@ func (b *SystemBus) Write(addr uint32, size uint32, val uint32) {
 // LoadROM 直接把镜像写入 ROM 区（供 ELF/测试用）。
 func (b *SystemBus) LoadROM(off uint32, data []byte) {
 	copy(b.rom[off:], data)
+}
+
+// CopyInto 把 data 拷入基址为 base 的已挂载动态 RAM 区，从区内的 off 偏移开始。
+// 用于把 ramdisk 镜像放进 flash 模拟区（如 base=FlashEmuBase, off=0x100000）。
+func (b *SystemBus) CopyInto(base, off uint32, data []byte) {
+	for _, r := range b.rams {
+		if r.base == base {
+			copy(r.data[off:], data)
+			return
+		}
+	}
+}
+
+// CopyOut 把 [base, base+len(dst)) 的内容拷出到 dst（调试用）。
+func (b *SystemBus) CopyOut(base uint32, dst []byte) {
+	for _, r := range b.rams {
+		if base >= r.base && base+uint32(len(dst)) <= r.base+uint32(len(r.data)) {
+			copy(dst, r.data[base-r.base:])
+			return
+		}
+	}
+	for i := range dst {
+		dst[i] = b.readRaw(base + uint32(i))
+	}
 }
 
 // 在 RAM/ROM 区间内返回切片（快速路径），否则返回 nil。
