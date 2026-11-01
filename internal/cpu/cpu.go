@@ -225,15 +225,17 @@ func (c *CPU) RunHot(max uint64) uint64 {
 			count++
 			continue
 		}
-		k := int(blk.n)
-		if max != 0 && uint64(k) > max-count {
-			k = int(max - count) // 只执行块的前缀，保证不超过 max
+		// 整批剩余预算交给 runBlock，它会在块链上连续执行到预算用完，
+		// 避免短块每切换一次就付出一次函数调用开销。
+		k := 1<<31 - 1
+		if max != 0 && max-count < uint64(k) {
+			k = int(max - count)
 		}
-		n := c.runBlock(blk, k)
+		n, stepped := c.runBlock(blk, k)
 		count += uint64(n)
 		hot += uint64(n)
-		if n < k {
-			count++ // 块内回退执行了一条 Step，计数由 Step 自己完成
+		if stepped {
+			count++ // 回退执行的一条 Step 已由 Step 自己记账
 		}
 	}
 	// 只有就地执行的指令需要补计数（回退部分已由 Step 记账）

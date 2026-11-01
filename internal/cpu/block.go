@@ -494,413 +494,444 @@ func decodeI16(inst uint32) (o hOp, ok bool, term bool) {
 	return o, false, true
 }
 
-// runBlock 执行块的前 n 条指令，返回实际就地执行的条数。
-// 途中遇到需要慢路径的指令（MMIO/对齐异常/U-mode 权限）时，先回退执行
-// 该条 Step 并提前返回；pc 停在 Step 之后的位置。
-func (c *CPU) runBlock(blk *hBlock, n int) int {
+// runBlock 在 budget 条指令的预算内连续执行基本块链：一个块跑完就直接
+// 就地取它的后继块继续跑，不再返回 RunHot 重新进入。
+//
+// 短块（2~3 条）切换频繁，若每块都调用一次函数，prologue/epilogue 的
+// 开销会吃掉解码缓存带来的收益；链式执行把这次开销摊到整批预算上。
+//
+// 返回就地执行的条数与是否额外回退执行了一条 Step（此时 c.pc 已由 Step
+// 更新，调用方只需给计数 +1）。
+func (c *CPU) runBlock(blk *hBlock, budget int) (int, bool) {
 	mem := c.flat
 	base := c.flatBase
 	size := uint32(len(mem))
 	x := &c.x
 	curPC := blk.start
-	for i := 0; i < n; i++ {
-		o := &blk.ops[i]
-		next := curPC + uint32(o.ln)
-		switch o.kind {
-		case kAddi:
-			if o.rd != 0 {
+	done := 0
+	for {
+		n := int(blk.n)
+		if remain := budget - done; n > remain {
+			n = remain
+		}
+		for i := 0; i < n; i++ {
+			o := &blk.ops[i&31]
+			next := curPC + uint32(o.ln)
+			switch o.kind {
+			case kAddi:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] + uint32(o.imm)
+				}
+				curPC = next
+			case kSlti:
+				if o.rd != 0 {
+					x[o.rd&31] = boolToU32(int32(x[o.rs1&31]) < o.imm)
+				}
+				curPC = next
+			case kSltiu:
+				if o.rd != 0 {
+					x[o.rd&31] = boolToU32(x[o.rs1&31] < uint32(o.imm))
+				}
+				curPC = next
+			case kXori:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] ^ uint32(o.imm)
+				}
+				curPC = next
+			case kOri:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] | uint32(o.imm)
+				}
+				curPC = next
+			case kAndi:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] & uint32(o.imm)
+				}
+				curPC = next
+			case kSlli:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] << (uint32(o.imm) & 0x1f)
+				}
+				curPC = next
+			case kSrli:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] >> (uint32(o.imm) & 0x1f)
+				}
+				curPC = next
+			case kSrai:
+				if o.rd != 0 {
+					x[o.rd&31] = uint32(int32(x[o.rs1&31]) >> (uint32(o.imm) & 0x1f))
+				}
+				curPC = next
+			case kAdd:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] + x[o.rs2&31]
+				}
+				curPC = next
+			case kSub:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] - x[o.rs2&31]
+				}
+				curPC = next
+			case kSll:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] << (x[o.rs2&31] & 0x1f)
+				}
+				curPC = next
+			case kSlt:
+				if o.rd != 0 {
+					x[o.rd&31] = boolToU32(int32(x[o.rs1&31]) < int32(x[o.rs2&31]))
+				}
+				curPC = next
+			case kSltu:
+				if o.rd != 0 {
+					x[o.rd&31] = boolToU32(x[o.rs1&31] < x[o.rs2&31])
+				}
+				curPC = next
+			case kXor:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] ^ x[o.rs2&31]
+				}
+				curPC = next
+			case kSrl:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] >> (x[o.rs2&31] & 0x1f)
+				}
+				curPC = next
+			case kSra:
+				if o.rd != 0 {
+					x[o.rd&31] = uint32(int32(x[o.rs1&31]) >> (x[o.rs2&31] & 0x1f))
+				}
+				curPC = next
+			case kOr:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] | x[o.rs2&31]
+				}
+				curPC = next
+			case kAnd:
+				if o.rd != 0 {
+					x[o.rd&31] = x[o.rs1&31] & x[o.rs2&31]
+				}
+				curPC = next
+			case kMulExt:
+				c.execM(uint32(o.imm), int(o.rd&31), x[o.rs1&31], x[o.rs2&31])
+				curPC = next
+			case kLui:
+				if o.rd != 0 {
+					x[o.rd&31] = uint32(o.imm)
+				}
+				curPC = next
+			case kAuipc:
+				if o.rd != 0 {
+					x[o.rd&31] = curPC + uint32(o.imm)
+				}
+				curPC = next
+			case kJal:
+				if o.rd != 0 {
+					x[o.rd&31] = curPC + 4
+				}
+				curPC += uint32(o.imm)
+			case kJalr:
+				t := (x[o.rs1&31] + uint32(o.imm)) &^ 1
+				if o.rd != 0 {
+					x[o.rd&31] = curPC + 4
+				}
+				curPC = t
+			case kBeq:
+				if x[o.rs1&31] == x[o.rs2&31] {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kBne:
+				if x[o.rs1&31] != x[o.rs2&31] {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kBlt:
+				if int32(x[o.rs1&31]) < int32(x[o.rs2&31]) {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kBge:
+				if int32(x[o.rs1&31]) >= int32(x[o.rs2&31]) {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kBltu:
+				if x[o.rs1&31] < x[o.rs2&31] {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kBgeu:
+				if x[o.rs1&31] >= x[o.rs2&31] {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kLb:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 {
+					if doff := addr - base; doff < size {
+						x[o.rd&31] = uint32(int8(mem[doff]))
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kLh:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 && addr&1 == 0 {
+					if doff := addr - base; doff < size-1 {
+						x[o.rd&31] = uint32(int16(uint16(mem[doff]) | uint16(mem[doff+1])<<8))
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kLw:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 && addr&3 == 0 {
+					if doff := addr - base; doff < size-3 {
+						x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
+							uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kLbu:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 {
+					if doff := addr - base; doff < size {
+						x[o.rd&31] = uint32(mem[doff])
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kLhu:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 && addr&1 == 0 {
+					if doff := addr - base; doff < size-1 {
+						x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kSb:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 {
+					if doff := addr - base; doff < size {
+						mem[doff] = uint8(x[o.rs2&31])
+						c.touchCode(doff)
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kSh:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 && addr&1 == 0 {
+					if doff := addr - base; doff < size-1 {
+						v := x[o.rs2&31]
+						mem[doff] = uint8(v)
+						mem[doff+1] = uint8(v >> 8)
+						c.touchCode(doff)
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kSw:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 && addr&3 == 0 {
+					if doff := addr - base; doff < size-3 {
+						v := x[o.rs2&31]
+						mem[doff] = uint8(v)
+						mem[doff+1] = uint8(v >> 8)
+						mem[doff+2] = uint8(v >> 16)
+						mem[doff+3] = uint8(v >> 24)
+						c.touchCode(doff)
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kNop:
+				curPC = next
+			case kCAddi4spn:
+				x[o.rd&31] = x[2] + uint32(o.imm)
+				curPC = next
+			case kCLw:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 && addr&3 == 0 {
+					if doff := addr - base; doff < size-3 {
+						x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
+							uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kCSw:
+				addr := x[o.rs1&31] + uint32(o.imm)
+				if c.priv != 0 && addr&3 == 0 {
+					if doff := addr - base; doff < size-3 {
+						v := x[o.rs2&31]
+						mem[doff] = uint8(v)
+						mem[doff+1] = uint8(v >> 8)
+						mem[doff+2] = uint8(v >> 16)
+						mem[doff+3] = uint8(v >> 24)
+						c.touchCode(doff)
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kCAddi:
 				x[o.rd&31] = x[o.rs1&31] + uint32(o.imm)
-			}
-			curPC = next
-		case kSlti:
-			if o.rd != 0 {
-				x[o.rd&31] = boolToU32(int32(x[o.rs1&31]) < o.imm)
-			}
-			curPC = next
-		case kSltiu:
-			if o.rd != 0 {
-				x[o.rd&31] = boolToU32(x[o.rs1&31] < uint32(o.imm))
-			}
-			curPC = next
-		case kXori:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] ^ uint32(o.imm)
-			}
-			curPC = next
-		case kOri:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] | uint32(o.imm)
-			}
-			curPC = next
-		case kAndi:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] & uint32(o.imm)
-			}
-			curPC = next
-		case kSlli:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] << (uint32(o.imm) & 0x1f)
-			}
-			curPC = next
-		case kSrli:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] >> (uint32(o.imm) & 0x1f)
-			}
-			curPC = next
-		case kSrai:
-			if o.rd != 0 {
-				x[o.rd&31] = uint32(int32(x[o.rs1&31]) >> (uint32(o.imm) & 0x1f))
-			}
-			curPC = next
-		case kAdd:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] + x[o.rs2&31]
-			}
-			curPC = next
-		case kSub:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] - x[o.rs2&31]
-			}
-			curPC = next
-		case kSll:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] << (x[o.rs2&31] & 0x1f)
-			}
-			curPC = next
-		case kSlt:
-			if o.rd != 0 {
-				x[o.rd&31] = boolToU32(int32(x[o.rs1&31]) < int32(x[o.rs2&31]))
-			}
-			curPC = next
-		case kSltu:
-			if o.rd != 0 {
-				x[o.rd&31] = boolToU32(x[o.rs1&31] < x[o.rs2&31])
-			}
-			curPC = next
-		case kXor:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] ^ x[o.rs2&31]
-			}
-			curPC = next
-		case kSrl:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] >> (x[o.rs2&31] & 0x1f)
-			}
-			curPC = next
-		case kSra:
-			if o.rd != 0 {
-				x[o.rd&31] = uint32(int32(x[o.rs1&31]) >> (x[o.rs2&31] & 0x1f))
-			}
-			curPC = next
-		case kOr:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] | x[o.rs2&31]
-			}
-			curPC = next
-		case kAnd:
-			if o.rd != 0 {
-				x[o.rd&31] = x[o.rs1&31] & x[o.rs2&31]
-			}
-			curPC = next
-		case kMulExt:
-			c.execM(uint32(o.imm), int(o.rd&31), x[o.rs1&31], x[o.rs2&31])
-			curPC = next
-		case kLui:
-			if o.rd != 0 {
+				curPC = next
+			case kCJal:
+				x[1] = curPC + 2
+				curPC += uint32(o.imm)
+			case kCLi:
 				x[o.rd&31] = uint32(o.imm)
-			}
-			curPC = next
-		case kAuipc:
-			if o.rd != 0 {
-				x[o.rd&31] = curPC + uint32(o.imm)
-			}
-			curPC = next
-		case kJal:
-			if o.rd != 0 {
-				x[o.rd&31] = curPC + 4
-			}
-			curPC += uint32(o.imm)
-		case kJalr:
-			t := (x[o.rs1&31] + uint32(o.imm)) &^ 1
-			if o.rd != 0 {
-				x[o.rd&31] = curPC + 4
-			}
-			curPC = t
-		case kBeq:
-			if x[o.rs1&31] == x[o.rs2&31] {
+				curPC = next
+			case kCAddi16sp:
+				x[2] = x[2] + uint32(o.imm)
+				curPC = next
+			case kCLui:
+				x[o.rd&31] = uint32(o.imm) << 12
+				curPC = next
+			case kCSrli:
+				x[o.rd&31] = x[o.rs1&31] >> (uint32(o.imm) & 0x1f)
+				curPC = next
+			case kCSrai:
+				x[o.rd&31] = uint32(int32(x[o.rs1&31]) >> (uint32(o.imm) & 0x1f))
+				curPC = next
+			case kCAndi:
+				x[o.rd&31] = x[o.rs1&31] & uint32(o.imm)
+				curPC = next
+			case kCSub:
+				x[o.rd&31] = x[o.rs1&31] - x[o.rs2&31]
+				curPC = next
+			case kCXor:
+				x[o.rd&31] = x[o.rs1&31] ^ x[o.rs2&31]
+				curPC = next
+			case kCOr:
+				x[o.rd&31] = x[o.rs1&31] | x[o.rs2&31]
+				curPC = next
+			case kCAnd:
+				x[o.rd&31] = x[o.rs1&31] & x[o.rs2&31]
+				curPC = next
+			case kCJ:
 				curPC += uint32(o.imm)
-			} else {
+			case kCBeqz:
+				if x[o.rs1&31] == 0 {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kCBnez:
+				if x[o.rs1&31] != 0 {
+					curPC += uint32(o.imm)
+				} else {
+					curPC = next
+				}
+			case kCSlli:
+				x[o.rd&31] = x[o.rs1&31] << (uint32(o.imm) & 0x1f)
+				curPC = next
+			case kCLwsp:
+				addr := x[2] + uint32(o.imm)
+				if c.priv != 0 && addr&3 == 0 {
+					if doff := addr - base; doff < size-3 {
+						x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
+							uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kCSwsp:
+				addr := x[2] + uint32(o.imm)
+				if c.priv != 0 && addr&3 == 0 {
+					if doff := addr - base; doff < size-3 {
+						v := x[o.rs2&31]
+						mem[doff] = uint8(v)
+						mem[doff+1] = uint8(v >> 8)
+						mem[doff+2] = uint8(v >> 16)
+						mem[doff+3] = uint8(v >> 24)
+						c.touchCode(doff)
+						curPC = next
+						break
+					}
+				}
+				c.pc = curPC
+				c.Step()
+				return done + i, true
+			case kCJr:
+				curPC = x[o.rd&31] &^ 1
+			case kCMv:
+				x[o.rd&31] = x[o.rs2&31]
+				curPC = next
+			case kCJalr:
+				x[1] = curPC + 2
+				curPC = x[o.rs1&31] &^ 1
+			case kCAdd:
+				x[o.rd&31] = x[o.rs1&31] + x[o.rs2&31]
 				curPC = next
 			}
-		case kBne:
-			if x[o.rs1&31] != x[o.rs2&31] {
-				curPC += uint32(o.imm)
-			} else {
-				curPC = next
-			}
-		case kBlt:
-			if int32(x[o.rs1&31]) < int32(x[o.rs2&31]) {
-				curPC += uint32(o.imm)
-			} else {
-				curPC = next
-			}
-		case kBge:
-			if int32(x[o.rs1&31]) >= int32(x[o.rs2&31]) {
-				curPC += uint32(o.imm)
-			} else {
-				curPC = next
-			}
-		case kBltu:
-			if x[o.rs1&31] < x[o.rs2&31] {
-				curPC += uint32(o.imm)
-			} else {
-				curPC = next
-			}
-		case kBgeu:
-			if x[o.rs1&31] >= x[o.rs2&31] {
-				curPC += uint32(o.imm)
-			} else {
-				curPC = next
-			}
-		case kLb:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 {
-				if doff := addr - base; doff < size {
-					x[o.rd&31] = uint32(int8(mem[doff]))
-					curPC = next
-					break
-				}
-			}
+		}
+		done += n
+		// 预算用完（含块被截断）就交还 RunHot。
+		if done >= budget {
 			c.pc = curPC
-			c.Step()
-			return i
-		case kLh:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 && addr&1 == 0 {
-				if doff := addr - base; doff < size-1 {
-					x[o.rd&31] = uint32(int16(uint16(mem[doff]) | uint16(mem[doff+1])<<8))
-					curPC = next
-					break
-				}
-			}
+			return done, false
+		}
+		// 块正常执行完：curPC 已是控制转移的结果，直接取后继块继续。
+		off := curPC - base
+		if off >= size-3 {
 			c.pc = curPC
-			c.Step()
-			return i
-		case kLw:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 && addr&3 == 0 {
-				if doff := addr - base; doff < size-3 {
-					x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
-						uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
-					curPC = next
-					break
-				}
-			}
+			return done, false // 越出平铺区，交给 RunHot 的逐条回退
+		}
+		succ := &c.blocks[((curPC>>1)^(curPC>>10))&(blockSlots-1)]
+		if succ.start == curPC && succ.gen == c.codeGen[off>>12] {
+			blk = succ
+			continue
+		}
+		if blk = c.blockFor(curPC, off); blk == nil {
 			c.pc = curPC
-			c.Step()
-			return i
-		case kLbu:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 {
-				if doff := addr - base; doff < size {
-					x[o.rd&31] = uint32(mem[doff])
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kLhu:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 && addr&1 == 0 {
-				if doff := addr - base; doff < size-1 {
-					x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kSb:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 {
-				if doff := addr - base; doff < size {
-					mem[doff] = uint8(x[o.rs2&31])
-					c.touchCode(doff)
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kSh:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 && addr&1 == 0 {
-				if doff := addr - base; doff < size-1 {
-					v := x[o.rs2&31]
-					mem[doff] = uint8(v)
-					mem[doff+1] = uint8(v >> 8)
-					c.touchCode(doff)
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kSw:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 && addr&3 == 0 {
-				if doff := addr - base; doff < size-3 {
-					v := x[o.rs2&31]
-					mem[doff] = uint8(v)
-					mem[doff+1] = uint8(v >> 8)
-					mem[doff+2] = uint8(v >> 16)
-					mem[doff+3] = uint8(v >> 24)
-					c.touchCode(doff)
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kNop:
-			curPC = next
-		case kCAddi4spn:
-			x[o.rd&31] = x[2] + uint32(o.imm)
-			curPC = next
-		case kCLw:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 && addr&3 == 0 {
-				if doff := addr - base; doff < size-3 {
-					x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
-						uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kCSw:
-			addr := x[o.rs1&31] + uint32(o.imm)
-			if c.priv != 0 && addr&3 == 0 {
-				if doff := addr - base; doff < size-3 {
-					v := x[o.rs2&31]
-					mem[doff] = uint8(v)
-					mem[doff+1] = uint8(v >> 8)
-					mem[doff+2] = uint8(v >> 16)
-					mem[doff+3] = uint8(v >> 24)
-					c.touchCode(doff)
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kCAddi:
-			x[o.rd&31] = x[o.rs1&31] + uint32(o.imm)
-			curPC = next
-		case kCJal:
-			x[1] = curPC + 2
-			curPC += uint32(o.imm)
-		case kCLi:
-			x[o.rd&31] = uint32(o.imm)
-			curPC = next
-		case kCAddi16sp:
-			x[2] = x[2] + uint32(o.imm)
-			curPC = next
-		case kCLui:
-			x[o.rd&31] = uint32(o.imm) << 12
-			curPC = next
-		case kCSrli:
-			x[o.rd&31] = x[o.rs1&31] >> (uint32(o.imm) & 0x1f)
-			curPC = next
-		case kCSrai:
-			x[o.rd&31] = uint32(int32(x[o.rs1&31]) >> (uint32(o.imm) & 0x1f))
-			curPC = next
-		case kCAndi:
-			x[o.rd&31] = x[o.rs1&31] & uint32(o.imm)
-			curPC = next
-		case kCSub:
-			x[o.rd&31] = x[o.rs1&31] - x[o.rs2&31]
-			curPC = next
-		case kCXor:
-			x[o.rd&31] = x[o.rs1&31] ^ x[o.rs2&31]
-			curPC = next
-		case kCOr:
-			x[o.rd&31] = x[o.rs1&31] | x[o.rs2&31]
-			curPC = next
-		case kCAnd:
-			x[o.rd&31] = x[o.rs1&31] & x[o.rs2&31]
-			curPC = next
-		case kCJ:
-			curPC += uint32(o.imm)
-		case kCBeqz:
-			if x[o.rs1&31] == 0 {
-				curPC += uint32(o.imm)
-			} else {
-				curPC = next
-			}
-		case kCBnez:
-			if x[o.rs1&31] != 0 {
-				curPC += uint32(o.imm)
-			} else {
-				curPC = next
-			}
-		case kCSlli:
-			x[o.rd&31] = x[o.rs1&31] << (uint32(o.imm) & 0x1f)
-			curPC = next
-		case kCLwsp:
-			addr := x[2] + uint32(o.imm)
-			if c.priv != 0 && addr&3 == 0 {
-				if doff := addr - base; doff < size-3 {
-					x[o.rd&31] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
-						uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kCSwsp:
-			addr := x[2] + uint32(o.imm)
-			if c.priv != 0 && addr&3 == 0 {
-				if doff := addr - base; doff < size-3 {
-					v := x[o.rs2&31]
-					mem[doff] = uint8(v)
-					mem[doff+1] = uint8(v >> 8)
-					mem[doff+2] = uint8(v >> 16)
-					mem[doff+3] = uint8(v >> 24)
-					c.touchCode(doff)
-					curPC = next
-					break
-				}
-			}
-			c.pc = curPC
-			c.Step()
-			return i
-		case kCJr:
-			curPC = x[o.rd&31] &^ 1
-		case kCMv:
-			x[o.rd&31] = x[o.rs2&31]
-			curPC = next
-		case kCJalr:
-			x[1] = curPC + 2
-			curPC = x[o.rs1&31] &^ 1
-		case kCAdd:
-			x[o.rd&31] = x[o.rs1&31] + x[o.rs2&31]
-			curPC = next
+			return done, false // 不支持热执行（系统指令/非法编码）
 		}
 	}
-	c.pc = curPC
-	return n
 }
 
 // touchCode 与总线共用同一份代码页表：CPU 直写平铺区时也要让本页的
