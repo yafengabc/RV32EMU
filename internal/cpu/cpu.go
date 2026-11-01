@@ -24,6 +24,13 @@ type CPU struct {
 	flat     []byte
 	flatBase uint32
 
+	// blocks 是基本块解码缓存（直接映射，见 block.go）。
+	// codePage/codeGen 与总线共享同一份底层数组：CPU 直写平铺区时也要
+	// 让该页已解码的块失效，否则自修改代码会执行到旧指令。
+	blocks   [blockSlots]hBlock
+	codePage []bool
+	codeGen  []uint32
+
 	// priv 是当前特权级：3 = M-mode，0 = U-mode。
 	// RV32EMU 只模拟 M/U 两级；MPP 由 enterTrap 据此设置，
 	// mret 时据此恢复，使 ecall 能区分 U-mode(8) / M-mode(11)。
@@ -67,6 +74,7 @@ func New(bus mem.Bus) *CPU {
 		c.fw = sb.FastWrite
 		c.flat = sb.FlatSlice()
 		c.flatBase = mem.FlatBase
+		c.codePage, c.codeGen = sb.CodePages()
 	} else {
 		c.fr = bus.Read
 		c.fw = bus.Write
@@ -164,439 +172,74 @@ func (c *CPU) Run(max uint64) {
 	}
 }
 
-// RunHot 是 Step 的批量内联版本：常见指令就地解码执行，其余（CSR/系统指令、
-// 非法编码、U-mode 访存、越出平铺区的取指）整条退回 Step 重新解码执行，
-// 因此异常语义（PMP、对齐、mepc、mtval）与 Step 完全一致。
+// RunHot 是 Step 的批量版本：按基本块执行（块由 block.go 预解码并缓存），
+// 块内指令就地执行；CSR/系统指令、非法编码、越出平铺区的取指、U-mode
+// 访存整条退回 Step，因此异常语义（PMP、对齐、mepc、mtval）与 Step 一致。
 //
-// 每 1024 条回到批边界采样一次 halted 与中断：中断的 mepc 指向批次首条
-// 指令，偏差最多 1024 条；tick 本身是指令计数近似，实际无影响。
-//
-// 前提：CPU 绑定了 SystemBus（有平铺区）；否则直接退回 Run。
+// 每个块边界采样一次 halted 与挂起中断（中断 mepc 指向块首条指令）。
+// 前提：CPU 绑定了 SystemBus（有平铺区）；否则直接退回逐条 Step。
 // 返回本次实际执行的指令数（供外层推进定时器/输入节流）。
 func (c *CPU) RunHot(max uint64) uint64 {
-	mem := c.flat
-	if mem == nil {
+	if c.flat == nil {
 		var i uint64
 		for ; (max == 0 || i < max) && c.Step(); i++ {
 		}
 		return i
 	}
-
-	x := &c.x
-	base := c.flatBase
-	pc := c.pc
-	size := uint32(len(mem))
-	var count, cold uint64 // count=已处理指令；cold=其中退回 Step 的条数
-
-hotloop:
+	size := uint32(len(c.flat))
+	if c.halted {
+		return 0
+	}
+	// 挂起中断只在批次之间变化（外设在 RunHot 返回后才推进），因此
+	// 每次调用采样一次即可；块边界只需检查 halted。
+	if c.pendingInt != 0 {
+		c.checkInterrupts()
+		if c.halted {
+			return 0
+		}
+	}
+	var count, hot uint64
 	for max == 0 || count < max {
 		if c.halted {
 			break
 		}
-		if c.pendingInt != 0 {
-			c.pc = pc
-			c.checkInterrupts()
-			pc = c.pc
-			if c.halted {
-				break
-			}
-		}
-		chunkEnd := count + 1024
-		if max != 0 && chunkEnd > max {
-			chunkEnd = max
-		}
-		for count < chunkEnd {
-			curPC := pc
-			off := curPC - base
-			// 取指越出平铺区（含 pc 低于 base 时的下溢）则退回 Step。
-			// 用 off >= size-3 而不是 off+3 >= size：后者在 off 下溢时会回绕。
-			if off >= size-3 {
-				c.pc = curPC
+		pc := c.pc
+		off := pc - c.flatBase
+		if off >= size-3 {
+			// 平铺区外取指（如 0x80000000 这类为 ELF 加载器分配的宿主内存）：
+			// 连续逐条 Step，直到回到平铺区、停机或达到上限。本次调用期间
+			// 挂起中断不会变化（外设在批次之间注入），因此无需逐条采样。
+			for max == 0 || count < max {
 				c.Step()
-				pc = c.pc
 				count++
-				cold++
-				if c.halted {
-					break hotloop
-				}
-				continue
-			}
-
-			low := uint32(mem[off]) | uint32(mem[off+1])<<8
-			hot := false
-
-			if low&0x3 == 0x3 {
-				instr := low | (uint32(mem[off+2])|uint32(mem[off+3])<<8)<<16
-				pc = curPC + 4
-				op := instr & 0x7f
-				f3 := (instr >> 12) & 0x7
-				r1 := int((instr >> 15) & 0x1f)
-				di := int((instr >> 7) & 0x1f)
-				switch op {
-				case 0x13: // OP-IMM
-					a := x[r1]
-					imm := immI(instr)
-					v := a
-					switch f3 {
-					case 0:
-						v = a + imm
-					case 2:
-						v = boolToU32(int32(a) < int32(imm))
-					case 3:
-						v = boolToU32(a < imm)
-					case 4:
-						v = a ^ imm
-					case 6:
-						v = a | imm
-					case 7:
-						v = a & imm
-					case 1:
-						v = a << (imm & 0x1f)
-					case 5:
-						if imm&0x400 != 0 {
-							v = uint32(int32(a) >> (imm & 0x1f))
-						} else {
-							v = a >> (imm & 0x1f)
-						}
-					}
-					if di != 0 {
-						x[di] = v
-						hot = true
-					}
-				case 0x63: // BRANCH
-					a := x[r1]
-					b := x[int((instr>>20)&0x1f)]
-					taken := false
-					switch f3 {
-					case 0:
-						taken = a == b
-					case 1:
-						taken = a != b
-					case 4:
-						taken = int32(a) < int32(b)
-					case 5:
-						taken = int32(a) >= int32(b)
-					case 6:
-						taken = a < b
-					case 7:
-						taken = a >= b
-					}
-					if taken {
-						pc = curPC + immB(instr)
-					}
-					hot = true
-				case 0x03: // LOAD
-					addr := x[r1] + immI(instr)
-					sz := uint32(4)
-					valid := true
-					switch f3 {
-					case 0:
-						sz = 1
-					case 1:
-						sz = 2
-					case 2:
-					case 4:
-						sz = 1
-					case 5:
-						sz = 2
-					default:
-						valid = false
-					}
-					// U-mode 必须逐条做 PMP 检查，整条退回 Step；
-					// M-mode 下 pmpCheck 恒放行，可安全直访。
-					if valid && di != 0 && c.priv != 0 && addr&(sz-1) == 0 {
-						if doff := addr - base; doff < size-sz+1 {
-							switch f3 {
-							case 0: // LB
-								x[di] = uint32(int8(mem[doff]))
-							case 1: // LH
-								x[di] = uint32(int16(uint16(mem[doff]) | uint16(mem[doff+1])<<8))
-							case 2: // LW
-								x[di] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
-									uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
-							case 4: // LBU
-								x[di] = uint32(mem[doff])
-							case 5: // LHU
-								x[di] = uint32(mem[doff]) | uint32(mem[doff+1])<<8
-							}
-							hot = true
-						}
-					}
-				case 0x23: // STORE
-					addr := x[r1] + immS(instr)
-					val := x[int((instr>>20)&0x1f)]
-					sz := uint32(4)
-					valid := true
-					switch f3 {
-					case 0:
-						sz = 1
-					case 1:
-						sz = 2
-					case 2:
-					default:
-						valid = false
-					}
-					if valid && c.priv != 0 && addr&(sz-1) == 0 {
-						if doff := addr - base; doff < size-sz+1 {
-							switch f3 {
-							case 0: // SB
-								mem[doff] = uint8(val)
-							case 1: // SH
-								mem[doff] = uint8(val)
-								mem[doff+1] = uint8(val >> 8)
-							case 2: // SW
-								mem[doff] = uint8(val)
-								mem[doff+1] = uint8(val >> 8)
-								mem[doff+2] = uint8(val >> 16)
-								mem[doff+3] = uint8(val >> 24)
-							}
-							hot = true
-						}
-					}
-				case 0x37: // LUI
-					if di != 0 {
-						x[di] = instr & 0xfffff000
-						hot = true
-					}
-				case 0x17: // AUIPC
-					if di != 0 {
-						x[di] = curPC + (instr & 0xfffff000)
-						hot = true
-					}
-				case 0x6f: // JAL
-					if di != 0 {
-						x[di] = curPC + 4
-					}
-					pc = curPC + immJ(instr)
-					hot = true
-				case 0x67: // JALR
-					t := (x[r1] + immI(instr)) &^ 1
-					if di != 0 {
-						x[di] = curPC + 4
-					}
-					pc = t
-					hot = true
-				case 0x33: // OP / M
-					a := x[r1]
-					b := x[int((instr>>20)&0x1f)]
-					f7 := instr >> 25
-					if f7 == 0x01 {
-						c.execM(f3, di, a, b) // execM 内部经 setRd，rd=0 自动丢弃
-						hot = true
-					} else if di != 0 {
-						v := a
-						switch f3 {
-						case 0:
-							if f7&0x20 != 0 {
-								v = a - b
-							} else {
-								v = a + b
-							}
-						case 1:
-							v = a << (b & 0x1f)
-						case 2:
-							v = boolToU32(int32(a) < int32(b))
-						case 3:
-							v = boolToU32(a < b)
-						case 4:
-							v = a ^ b
-						case 5:
-							if f7&0x20 != 0 {
-								v = uint32(int32(a) >> (b & 0x1f))
-							} else {
-								v = a >> (b & 0x1f)
-							}
-						case 6:
-							v = a | b
-						case 7:
-							v = a & b
-						}
-						x[di] = v
-						hot = true
-					}
-				case 0x0f: // FENCE -> NOP
-					hot = true
-				}
-			} else {
-				// 16-bit 压缩指令：就地解码，curPC 用本地量。
-				inst := low
-				pc = curPC + 2
-				switch inst & 0x3 {
-				case 0x0:
-					switch (inst >> 13) & 0x7 {
-					case 0x0: // C.ADDI4SPN
-						if imm := cAddi4spnImm(inst); imm != 0 {
-							x[cReg((inst>>2)&0x7)] = x[2] + imm
-							hot = true
-						}
-					case 0x2: // C.LW
-						rd := cReg((inst >> 2) & 0x7)
-						addr := x[cReg((inst>>7)&0x7)] + cLWOff(inst)
-						if c.priv != 0 && addr&3 == 0 {
-							if doff := addr - base; doff < size-3 {
-								x[rd] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
-									uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
-								hot = true
-							}
-						}
-					case 0x6: // C.SW
-						v := x[cReg((inst>>2)&0x7)]
-						addr := x[cReg((inst>>7)&0x7)] + cLWOff(inst)
-						if c.priv != 0 && addr&3 == 0 {
-							if doff := addr - base; doff < size-3 {
-								mem[doff] = uint8(v)
-								mem[doff+1] = uint8(v >> 8)
-								mem[doff+2] = uint8(v >> 16)
-								mem[doff+3] = uint8(v >> 24)
-								hot = true
-							}
-						}
-					}
-				case 0x1:
-					rd5 := (inst >> 7) & 0x1f
-					cd := cReg((inst >> 7) & 0x7)
-					simm := signExtend(((inst>>12)&1)<<5|((inst>>2)&0x1f), 6)
-					switch (inst >> 13) & 0x7 {
-					case 0x0: // C.ADDI
-						if rd5 != 0 {
-							x[rd5] = x[rd5] + simm
-							hot = true
-						}
-					case 0x1: // C.JAL
-						x[1] = curPC + 2
-						pc = curPC + cJOffset(inst)
-						hot = true
-					case 0x2: // C.LI
-						if rd5 != 0 {
-							x[rd5] = simm
-							hot = true
-						}
-					case 0x3:
-						if rd5 == 2 { // C.ADDI16SP
-							x[2] = x[2] + cAddi16spImm(inst)
-							hot = true
-						} else if rd5 != 0 { // C.LUI
-							x[rd5] = simm << 12
-							hot = true
-						}
-					case 0x4: // C.SRLI/C.SRAI/C.ANDI/寄存器运算
-						shamt := (inst >> 2) & 0x1f
-						switch (inst >> 10) & 0x3 {
-						case 0x0: // C.SRLI
-							x[cd] = x[cd] >> shamt
-							hot = true
-						case 0x1: // C.SRAI
-							x[cd] = uint32(int32(x[cd]) >> shamt)
-							hot = true
-						case 0x2: // C.ANDI
-							x[cd] = x[cd] & simm
-							hot = true
-						case 0x3:
-							rs2 := cReg((inst >> 2) & 0x7)
-							switch (inst >> 5) & 0x3 {
-							case 0x0:
-								x[cd] = x[cd] - x[rs2]
-							case 0x1:
-								x[cd] = x[cd] ^ x[rs2]
-							case 0x2:
-								x[cd] = x[cd] | x[rs2]
-							case 0x3:
-								x[cd] = x[cd] & x[rs2]
-							}
-							hot = true
-						}
-					case 0x5: // C.J
-						pc = curPC + cJOffset(inst)
-						hot = true
-					case 0x6: // C.BEQZ
-						if x[cd] == 0 {
-							pc = curPC + cBOffset(inst)
-						}
-						hot = true
-					case 0x7: // C.BNEZ
-						if x[cd] != 0 {
-							pc = curPC + cBOffset(inst)
-						}
-						hot = true
-					}
-				case 0x2:
-					rd5 := (inst >> 7) & 0x1f
-					switch (inst >> 13) & 0x7 {
-					case 0x0: // C.SLLI
-						if rd5 != 0 {
-							x[rd5] = x[rd5] << ((inst >> 2) & 0x1f)
-							hot = true
-						}
-					case 0x2: // C.LWSP
-						addr := x[2] + cLWSPOff(inst)
-						if rd5 != 0 && c.priv != 0 && addr&3 == 0 {
-							if doff := addr - base; doff < size-3 {
-								x[rd5] = uint32(mem[doff]) | uint32(mem[doff+1])<<8 |
-									uint32(mem[doff+2])<<16 | uint32(mem[doff+3])<<24
-								hot = true
-							}
-						}
-					case 0x6: // C.SWSP
-						v := x[(inst>>2)&0x1f]
-						addr := x[2] + cSWSPOff(inst)
-						if c.priv != 0 && addr&3 == 0 {
-							if doff := addr - base; doff < size-3 {
-								mem[doff] = uint8(v)
-								mem[doff+1] = uint8(v >> 8)
-								mem[doff+2] = uint8(v >> 16)
-								mem[doff+3] = uint8(v >> 24)
-								hot = true
-							}
-						}
-					case 0x4:
-						rs2 := (inst >> 2) & 0x1f
-						if (inst>>12)&1 == 0 {
-							if rs2 == 0 { // C.JR
-								if rd5 != 0 {
-									pc = x[rd5] &^ 1
-									hot = true
-								}
-							} else if rd5 != 0 { // C.MV
-								x[rd5] = x[rs2]
-								hot = true
-							}
-						} else {
-							if rs2 == 0 { // C.JALR
-								if rd5 != 0 {
-									x[1] = curPC + 2
-									pc = x[rd5] &^ 1
-									hot = true
-								}
-							} else if rd5 != 0 { // C.ADD
-								x[rd5] = x[rd5] + x[rs2]
-								hot = true
-							}
-						}
-					}
+				if c.halted || c.pc-c.flatBase < size-3 {
+					break
 				}
 			}
-
-			if !hot {
-				// 退回 Step 重新解码本条（含异常/非法/权限/越界等全部检查）
-				c.pc = curPC
-				c.Step()
-				pc = c.pc
-				count++
-				cold++
-				if c.halted {
-					break hotloop
-				}
-				continue
-			}
+			continue
+		}
+		blk := c.blockFor(pc, off)
+		if blk == nil {
+			// 系统指令 / 非法编码：交给慢路径，异常语义由它负责
+			c.Step()
 			count++
+			continue
+		}
+		k := int(blk.n)
+		if max != 0 && uint64(k) > max-count {
+			k = int(max - count) // 只执行块的前缀，保证不超过 max
+		}
+		n := c.runBlock(blk, k)
+		count += uint64(n)
+		hot += uint64(n)
+		if n < k {
+			count++ // 块内回退执行了一条 Step，计数由 Step 自己完成
 		}
 	}
-
-	c.pc = pc
-	// 只有就地执行的指令需要补计数（cold 部分已由 Step 自行记账）
-	c.csr.mcycle += count - cold
-	c.csr.minstret += count - cold
-	c.instCount += count - cold
+	// 只有就地执行的指令需要补计数（回退部分已由 Step 记账）
+	c.csr.mcycle += hot
+	c.csr.minstret += hot
+	c.instCount += hot
 	return count
 }
 

@@ -34,6 +34,12 @@ type SystemBus struct {
 	sram []byte
 	devs []DeviceRange
 	rams []ramRegion
+
+	// codePage/codeGen 是平铺区按 4KiB 页的代码版本表，供 CPU 的解码缓存
+	// 判断「这一页的指令字节有没有被改写」（自修改代码、SPI1 擦 flash）。
+	// codePage[p] 为真时，对页 p 的写才需要把 codeGen[p]+1。
+	codePage []bool
+	codeGen  []uint32
 	// 未映射访问按地址去重上报：只报一次全局会把后面真正的外设缺口
 	// 全部吞掉（曾因此漏掉 RTC_CNTL），逐个地址报又会被循环刷屏。
 	unmappedR map[uint32]bool
@@ -51,6 +57,8 @@ type ramRegion struct {
 func NewSystemBus() *SystemBus {
 	b := &SystemBus{
 		flat:      make([]byte, FlatSize),
+		codePage:  make([]bool, FlatSize>>12),
+		codeGen:   make([]uint32, FlatSize>>12),
 		unmappedR: make(map[uint32]bool),
 		unmappedW: make(map[uint32]bool),
 	}
@@ -61,6 +69,37 @@ func NewSystemBus() *SystemBus {
 
 // FlatSlice 返回平铺区，供 CPU 做「地址减基址」式直访。
 func (b *SystemBus) FlatSlice() []byte { return b.flat }
+
+// CodePages 返回代码页标记与页版本号，供 CPU 的解码缓存校验。
+// 两个切片与总线共享底层数组，CPU 直写平铺区时也按同一规则记账。
+func (b *SystemBus) CodePages() ([]bool, []uint32) { return b.codePage, b.codeGen }
+
+// touchCode 记录一次对平铺区的写：该页曾被当作代码页时，把页版本号 +1，
+// 让解码缓存里这一页的块失效。数据页不受影响（codePage 为假时零开销）。
+func (b *SystemBus) touchCode(addr uint32) {
+	if off := addr - FlatBase; off < FlatSize {
+		if p := off >> 12; b.codePage[p] {
+			b.codeGen[p]++
+		}
+	}
+}
+
+// touchCodeRange 使 [base, base+n) 覆盖的所有代码页失效（装载镜像用）。
+func (b *SystemBus) touchCodeRange(base, n uint32) {
+	if n == 0 {
+		return
+	}
+	lo := base - FlatBase
+	hi := lo + n - 1
+	if lo >= FlatSize {
+		return
+	}
+	for p := lo >> 12; p <= hi>>12 && p < uint32(len(b.codeGen)); p++ {
+		if b.codePage[p] {
+			b.codeGen[p]++
+		}
+	}
+}
 
 // AddRAM 动态挂一段 RAM（供 ELF 加载器为未映射段自动分配）。
 // 落在平铺区内的段直接切平铺区的视图，避免出现「总线写一份、
@@ -131,6 +170,7 @@ func (b *SystemBus) readRaw(addr uint32) uint8 {
 }
 
 func (b *SystemBus) writeRaw(addr uint32, v uint8) {
+	b.touchCode(addr)
 	switch {
 	case in(addr, ROMBase, ROMSize):
 		b.rom[addr-ROMBase] = v // ROM 也允许写（便于把固件段拷进去）
@@ -215,6 +255,7 @@ func (b *SystemBus) Write(addr uint32, size uint32, val uint32) {
 // LoadROM 直接把镜像写入 ROM 区（供 ELF/测试用）。
 func (b *SystemBus) LoadROM(off uint32, data []byte) {
 	copy(b.rom[off:], data)
+	b.touchCodeRange(ROMBase+off, uint32(len(data)))
 }
 
 // CopyInto 把 data 拷入基址为 base 的已挂载动态 RAM 区，从区内的 off 偏移开始。
@@ -223,6 +264,7 @@ func (b *SystemBus) CopyInto(base, off uint32, data []byte) {
 	for _, r := range b.rams {
 		if r.base == base {
 			copy(r.data[off:], data)
+			b.touchCodeRange(base+off, uint32(len(data)))
 			return
 		}
 	}
@@ -287,6 +329,7 @@ func (b *SystemBus) FastRead(addr uint32, size uint32) uint32 {
 // FastWrite 热路径写。
 func (b *SystemBus) FastWrite(addr uint32, size uint32, val uint32) {
 	if off := addr - FlatBase; off < FlatSize-size+1 {
+		b.touchCode(addr)
 		switch size {
 		case 1:
 			b.flat[off] = uint8(val)
