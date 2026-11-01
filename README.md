@@ -171,6 +171,12 @@ tinygo build -target=riscv-qemu -o bench.elf .
 - ROM 没有真机 dump：`esp_rom_spiflash_read/write/config_param` 用三条手写
   RV32I 蹦床桩顶替（`internal/rom`），行为等价于「按字节 memcpy 到 flash 模拟区」。
 - 未做精确外设时序：tick 按「每 N 条指令」计，而不是墙钟。
+- **UART 接收中断没有建模**：真机上内核把 UART0 的 RX 中断路由到 INTMTX 的 CPU
+  line 3，是一条独立于 tick 的唤醒路径；这里 INTMTX 是被动影子，不会真的拉起
+  中断，所以输入走的是内核保留的 tick 轮询兜底。功能不受影响，只是输入延迟按
+  tick 量化。
+- 也正因如此，**真机上「粘贴长命令丢字节」那类问题在这里复现不出来**：管道的
+  写入速率没有 115200 的物理上限，tick 之间永远不会堆满 128 字节的接收 FIFO。
 - **用模拟器抓到并已修复的一个内核 bug**：`sched_switch` 选择任务与探测「还有人
   在等吗」原本是两个可被 tick 打断的独立动作。`sched_idle()` 打开的中断之后不会
   再关，所以从第一次 idle 起这个重试循环就是可抢占的；tick 若落在
