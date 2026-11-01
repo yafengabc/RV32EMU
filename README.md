@@ -171,15 +171,15 @@ tinygo build -target=riscv-qemu -o bench.elf .
 - ROM 没有真机 dump：`esp_rom_spiflash_read/write/config_param` 用三条手写
   RV32I 蹦床桩顶替（`internal/rom`），行为等价于「按字节 memcpy 到 flash 模拟区」。
 - 未做精确外设时序：tick 按「每 N 条指令」计，而不是墙钟。
-- **已知的内核侧时序问题**（不是模拟器缺陷）：tick 恰好落在 `sched_pick` 扫描
-  中途时，`process_tick` 会把等待输入的任务置为 `ST_READY`，而 `sched_pick`
-  已经扫过该槽位，本轮返回 NULL；此时 `proc_waiting()` 已为假，于是走到
-  `panic("no runnable process")`。现象是 shell 偶发 panic，把 tick 周期拉长
-  （`-tickdiv 2`）即消失。QEMU 因时序不同不易命中。最小复现：
+- **用模拟器抓到并已修复的一个内核 bug**：`sched_switch` 选择任务与探测「还有人
+  在等吗」原本是两个可被 tick 打断的独立动作。`sched_idle()` 打开的中断之后不会
+  再关，所以从第一次 idle 起这个重试循环就是可抢占的；tick 若落在
+  `sched_pick()` 与 `proc_waiting()` 之间，扫描已经走过刚被唤醒的槽位（本轮不会
+  回头看 `rr` 之前）而返回 NULL，探测又因为该任务已变 `ST_READY` 而返回「没人等」，
+  两者相加就成了 `panic("no runnable process")` —— 机器上明明有一个能跑的 shell。
 
-  ```
-  run wfile a xxxxxxxx...（180 字节左右）
-  run hello
-  ```
-
-  修法在 TinyOS 侧：`sched_switch` 在 panic 前重新扫一次，或在扫描期间关中断。
+  确定性节拍让这个窗口可以从指令级复现（`-tickdiv 1` 必现，拉长周期即消失，
+  QEMU 因时序不同很少命中），这也是发现它的方法：`-traplog` + `-breakpc` 停在
+  panic 调用点 + `-dumpram` 快照，快照里 `procs[0]`(sh) 是 `ST_READY`，而代码
+  判定「无就绪」。TinyOS 侧修法是让选择与探测处于同一个关中断区间（commit
+  `dbe0e90`），不再需要 `-tickdiv` 兜底。
