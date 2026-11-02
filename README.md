@@ -170,6 +170,23 @@ tinygo build -target=riscv-qemu -o bench.elf .
 
 模拟器成功跑通 TinyGo 运行时（启动 + BSS 清零 + 算法计算 + GC），证明取指→译码→执行→访存→异常链路正确。
 
+## C 移植版
+
+`rv32emu-c/` 是同一套 RV32IMC/ESP32-C3 模拟器的 C11 移植，保留平铺总线、
+基本块缓存、块链执行、PMP/trap 语义和全部外设模型。构建、运行与逐项速度对比
+见 `rv32emu-c/README.md`；一键复现：
+
+```powershell
+cd rv32emu-c
+.\bench\compare.ps1 -Reps 7 -IncludeTinyOS
+```
+
+在同一套 `RunHot(1000)` 计时口径下，C 版相对 Go 版快 **1.05x ~ 1.42x**
+（fib(28) 1.26x、ALU loop 1.15x、memory loop 1.31x、排序 1.31x、筛法 1.42x、
+TinyOS 启动 1.28x；紧循环抖动较大，C 在每次运行里都更快）。Unicorn 2.1.4 的
+RISC-V 前端跑不了这些带分支的镜像（长 TB 里被跳转的分支会执行跳转目标），
+对比过程和原因见 `rv32emu-c/bench/README.md`。
+
 ## 当前边界 / 后续扩展
 
 - 外设覆盖 TinyOS 实际用到的部分：UART0、GPIO 影子、TIMG0 节拍、INTMTX
