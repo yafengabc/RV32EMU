@@ -99,7 +99,8 @@ var (
 	dataBase = flag.Uint64("data", 0x3FC80000, "scratch data base (4 KiB aligned)")
 	exitMode = flag.String("exit", "halt", "halt: ebreak; uart: print a0 + power off (QEMU virt); spin: print a0 + spin (ESP32-C3 QEMU)")
 	uartPage = flag.Uint("uart", 0x10000, "UART base page (0x10000 = 16550 on virt, 0x60000 = ESP32-C3 UART0)")
-	reps     = flag.Int("reps", 0, "repeat count for sort/sieve (0 = built-in default)")
+	reps     = flag.Int("reps", 0, "repeat count override for pi/sort/sieve (0 = built-in default)")
+	work     = flag.Int("work", 1, "multiply the default repeat counts (long runs for QEMU timing)")
 )
 
 // exitStub ends a program: ebreak+dead loop for rv32emu, or a jump over a dead
@@ -235,25 +236,34 @@ func writeELF(name string) {
 	code = nil
 }
 
-// benchPi is the original Leibniz loop; its hand-computed offsets are kept so
-// the default output stays byte-identical to earlier releases.
-func benchPi() {
-	emit(uR(2, spPage()))            // 0:  lui sp
-	emit(iR(5, 0, 0, 0, 0x13))       // 4:  sum=0
-	emit(iR(6, 0, 0, 0, 0x13))       // 8:  k=0
-	emit(iR(7, 0, 1, 0, 0x13))       // 12: sign=+1 (multiplying by 0x10000 overflows)
-	emit(uR(28, 0x2))                // 16: x28=0x2000
-	emit(iR(28, 28, 0x710, 0, 0x13)) // 20: N=0x2710=10000
-	emit(iR(29, 6, 1, 1, 0x13))      // 24: slli x29,x6,1
-	emit(iR(29, 29, 1, 0, 0x13))     // 28: addi x29,x29,1
-	emit(uR(30, 0x10))               // 32: x30=0x10000
-	emit(rR(30, 30, 29, 5, 0x01))    // 36: divu
-	emit(rR(31, 7, 30, 0, 0x01))     // 40: mul (MULDIV: f7=0x01, f3=0)
-	emit(rR(5, 5, 31, 0, 0x00))      // 44: add sum
-	emit(iR(6, 6, 1, 0, 0x13))       // 48: k++
-	emit(rR(7, 0, 7, 0, 0x20))       // 52: sub
-	emit(bR(6, 28, -32, 4))          // 56: blt k,N,loop
-	emit(iR(10, 5, 2, 1, 0x13))      // 60: slli a0,x5,2
+// benchPi sums the Leibniz series (Q16.16, N=10000) repsCount times and leaves
+// a0 = sum << 2 (~pi). The outer repeat makes it long enough to time: one pass
+// is only ~90k instructions, which is below the noise floor of a process-level
+// wall clock.
+func benchPi(repsCount int) {
+	emit(uR(2, spPage()))
+	li(20, int32(repsCount)) // x20 = repeats
+
+	label("piRep")
+	emit(iR(5, 0, 0, 0, 0x13)) // sum = 0
+	emit(iR(6, 0, 0, 0, 0x13)) // k = 0
+	emit(iR(7, 0, 1, 0, 0x13)) // sign = +1
+	li(28, 10000)              // N
+	label("piLoop")
+	emit(iR(29, 6, 1, 1, 0x13)) // denom = 2k + 1
+	emit(iR(29, 29, 1, 0, 0x13))
+	emit(uR(30, 0x10))            // term = 65536
+	emit(rR(30, 30, 29, 5, 0x01)) // divu
+	emit(rR(31, 7, 30, 0, 0x01))  // mul (sign is +-1: no 32-bit overflow)
+	emit(rR(5, 5, 31, 0, 0x00))   // sum += term
+	emit(iR(6, 6, 1, 0, 0x13))    // k++
+	emit(rR(7, 0, 7, 0, 0x20))    // sign = -sign
+	br(6, 28, 4, "piLoop")        // blt k, N, piLoop
+	emit(iR(20, 20, -1, 0, 0x13))
+	br(20, 0, 1, "piRep") // bne x20, x0, piRep
+
+	emit(iR(10, 5, 2, 1, 0x13)) // a0 = sum << 2
+	resolve()
 	exitStub()
 	epilogue()
 	writeELF("bench_pi.elf")
@@ -368,12 +378,16 @@ func main() {
 	}
 	labels = map[string]int{}
 
-	sortReps, sieveReps := 19000, 1340
+	w := *work
+	if w < 1 {
+		w = 1
+	}
+	sortReps, sieveReps, piReps := 19000*w, 1340*w, 220*w
 	if *reps > 0 {
-		sortReps, sieveReps = *reps, *reps
+		sortReps, sieveReps, piReps = *reps, *reps, *reps
 	}
 
-	benchPi()
+	benchPi(piReps)
 	benchSort(sortReps)
 	benchSieve(sieveReps)
 }

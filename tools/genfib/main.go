@@ -101,6 +101,7 @@ var (
 	outPath  = flag.String("out", "fib.elf", "output ELF (a directory means fib.elf inside it)")
 	base     = flag.Uint("base", 0x40000000, "load/entry base")
 	stackTop = flag.Uint64("stack", 0x3FCFF000, "initial sp (must be 4 KiB aligned)")
+	nArg     = flag.Int("n", 28, "fib argument")
 	exitMode = flag.String("exit", "halt", "halt: ebreak; uart: print a0 + power off (QEMU virt); spin: print a0 + spin (ESP32-C3 QEMU)")
 	uartPage = flag.Uint("uart", 0x10000, "UART base page (0x10000 = 16550 on virt, 0x60000 = ESP32-C3 UART0)")
 )
@@ -181,8 +182,8 @@ func main() {
 		s0 = 9
 		t0 = 5
 		t1 = 6
-		n  = 28
 	)
+	n := int32(*nArg)
 
 	// 0: lui sp, top of SRAM
 	emit(uType(sp, uint32(*stackTop>>12)))

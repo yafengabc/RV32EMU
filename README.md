@@ -214,7 +214,9 @@ fib(28) 约 59.6 MIPS，现在同一负载在本机约 383 MIPS（主机不同�
   比值按区间看，不要当成固定倍率。
 - **QEMU 交叉验证**：`rv32emu-c/bench/qemu_check.py` 把同样四个程序跑在 QEMU 上
   （乐鑫 `esp32c3` 机器按真机 C3 映射，或上游 `virt` 重链接），输出的 a0 与 Go/C
-  以及独立的 Python 模型一致。
+  以及独立的 Python 模型一致。QEMU 是 TCG/JIT，同一台机器上约 1.1~6.5 GIPS
+  （递归 fib ~1115、pi ~6490、排序 ~2640、筛法 ~3550 MIPS），比 Go/C 解释器快
+  2.5~15 倍，循环越紧差距越大；详见该仓库 README 的「在 QEMU 上验证」。
 - 一键复现（需要 RV32EMU-C 仓库）：
 
 ```powershell
