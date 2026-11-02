@@ -224,6 +224,14 @@ cd rv32emu-c
 .\bench\compare.ps1 -Reps 7 -IncludeTinyOS
 ```
 
+### 为什么自己写模拟器
+
+这个项目起因于 QEMU：TinyOS 在 QEMU 上跑基准时频繁超时，最后定位到 TCG 在 `memcpy`
+这类循环上性能劣化 100 多倍——clang 生成的指令序列落在了 TCG 的低效路径上。
+C 版 README 里的实测可以复现这个现象：同一份 `bench`（256 KiB 拷贝）在 rv32emu 上
+25 ms，在乐鑫 QEMU 的 esp32c3 机器上 9.1 s，约 360 倍，而且随数据量非线性恶化。
+所以 TinyOS 的速度数据用自家解释器 / C 移植来测，QEMU 只做功能对照。
+
 ### 与 Unicorn 2.1.4：旧表已作废
 
 早期 README 里那张 Unicorn 对比表（紧循环 13.8x、fib 2.0x、TinyGo 2.1x）是在另一台机器、
