@@ -19,9 +19,8 @@ firmware/bench/bench.elf
 firmware/bench/bench_qemu.elf
 firmware/bench/bench_js.go
 
-# Python
-__pycache__/
-*.pyc
+# Object files
+*.o
 
 # Project artifacts
 fib.elf

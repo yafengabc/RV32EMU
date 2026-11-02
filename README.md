@@ -255,7 +255,7 @@ C 版 README 里的实测可以复现这个现象：同一份 `bench`（256 KiB 
 也就是说在「每条指令都要记账」的口径下，JIT 并不占便宜。
 
 结论：那张表不再是有效参考。要么换成能正确执行 RISC-V 的 Unicorn/QEMU 版本重测，
-要么就以 Go vs C 的对比为准；复现方法和探针代码在 `rv32emu-c/bench/README.md`。
+要么就以 Go vs C 的对比为准；复现方法和结论在 `rv32emu-c/bench/README.md`。
 
 ## TinyGo 固件验证
 
