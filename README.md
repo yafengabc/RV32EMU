@@ -1,21 +1,30 @@
 # RV32EMU — ESP32-C3 行为对齐的 RV32IMC 指令集模拟器
 
-Go 实现，单核，严格对齐 ESP32-C3（RV32IMC，无 F/D 浮点）。
-流水线分层：**取指(IF) → 译码(ID) → 执行(EX) → 访存(MEM) → 写回(WB)**，译码表独立可扩展。
+Go 实现，单核，严格对齐 ESP32-C3（RV32IMC，无 F/D 浮点，无 A 原子扩展）。
+
+执行有两条路径，共用同一份语义实现：
+
+- **`Step()`**：逐条取指 → 译码 → 执行 → 访存。`-trace` / `-step` / `-fault` 和单测走这条。
+- **`RunHot(n)`**：默认路径。把直线代码段预解码成最多 32 条操作，缓存在 512 槽直接映射表里；
+  以 4 KiB 代码页版本号失效，块尾必是控制转移；跑完一块直接跳后继块（块链），不返回调用方。
+  另有等价性测试（`runhot_equiv_test.go`）保证两条路径结果一致。
 
 ## 目录结构
 
 ```
 rv32emu/
 ├─ go.mod / main.go            CLI：-elf / -ramdisk / -trace / -step / -max
+├─ tools/benchrun/             计时器（与 rv32emu-c 的 -bench 同一口径）
 ├─ internal/
 │  ├─ cpu/                     CPU 核心
-│  │  ├─ cpu.go               状态、Step() 主循环、对齐检查
+│  │  ├─ cpu.go               状态、Step() 参考解释器、对齐检查
+│  │  ├─ block.go             基本块解码缓存 + RunHot() 块链执行（默认路径）
 │  │  ├─ execute.go           RV32I + M(mul/div/rem) 执行语义
 │  │  ├─ compressed.go        C 扩展 16-bit 译码执行
 │  │  ├─ csr.go               mstatus/mtvec/mepc/mcause + pmpcfg0..3/pmpaddr0..15
 │  │  ├─ pmp.go               PMP 强制检查（U-mode 必须命中，M-mode 放行）
-│  │  └─ trap.go              异常进入、mret、vectored 派发、中断投递
+│  │  ├─ trap.go              异常进入、mret、vectored 派发、中断投递
+│  │  └─ *_test.go            RunHot/Step 等价性、C 扩展、自修改代码、性能基准
 │  ├─ mem/                     总线 + 地址映射
 │  │  ├─ bus.go               Bus/Peripheral 接口
 │  │  └─ memory.go            ROM/SRAM/动态 RAM/flash 模拟区，外设整字访问
@@ -71,6 +80,7 @@ CLI 参数（常用的）：
 | `-entry` | bin 加载基址（默认 `0x40000000`） |
 | `-max N` | 最大指令数（0=跑到停机） |
 | `-trace` / `-tracefrom` / `-traceto` | 逐条反汇编，可限定指令区间 |
+| `-traceirq N` / `-traceirqn M` | 第 N 次中断后开始逐条跟踪 M 条（看 trap 入口） |
 | `-step N` | 执行 N 条后暂停并 dump 寄存器 |
 | `-fault` | 停在第一次**同步异常**并回放前 48 条指令 |
 | `-traplog` | 打印每次同步异常（cause/mepc/mtval），过滤掉 ecall |
@@ -134,7 +144,13 @@ CLI 参数（常用的）：
 go test ./...
 ```
 
-覆盖：UART0 字符输出、M 扩展乘除（含有符号 `-7/3`）、C 压缩指令 `c.addi`、非法指令异常 mcause=2。
+覆盖：UART0 字符输出、M 扩展乘除（含有符号 `-7/3`）、C 压缩指令（`c.addi`、
+`c.lwsp/c.swsp`、分支/跳转偏移）、非法指令异常 `mcause=2`。
+
+另外 `runhot_equiv_test.go` 专门盯两条执行路径的一致性：整段程序 `RunHot` 与逐条 `Step`
+的寄存器/PC 必须相同，解码出的块逐条重放也要相同；还有两条自修改代码用例，保证块缓存在
+代码被改写后不会命中过期块。`perf_test.go` / `cpu_bench_test.go` 是性能基准（`go test -bench .` 出 ns/op，
+换算成每条指令的耗时即可和上面的 MIPS 对照）。
 
 ## ESP-IDF 测试固件
 
@@ -148,15 +164,78 @@ idf.py build
 ```
 固件直接写 UART0 FIFO 寄存器打印结果，模拟器映射到 stdout，行为与真实 C3 一致。
 
-## 性能对比（i9-11950H，Windows）
+## 性能
 
-| 基准 | Go 模拟器 | Unicorn 2.1.4 | 比值 |
-|------|-----------|---------------|------|
-| 紧循环 ALU（6M 指令） | ~58 MIPS | ~800 MIPS | 13.8x |
-| fib(28) 递归（15.4M 指令） | 59.6 MIPS | 120.5 MIPS | 2.0x |
-| TinyGo 运行时（5M 指令，含 pi/排序/素数筛） | 31.7 MIPS | 67.4 MIPS | 2.1x |
+### 口径
 
-真实算法负载（TinyGo 运行时）下 Unicorn 仅快 2 倍——JIT 优势被内存访存和分支稀释。
+只计模拟执行本身：`RunHot(1000)` 批次 + TIMG0 tick，不含进程启动、ELF 加载和终端输出；
+每个负载跑 7 次取中位数。Go 侧用 `tools/benchrun`（与 `rv32emu-c -bench` 是同一套批次循环），
+C 侧用 `-bench`。主机：AMD Ryzen 7 255（8C/16T），Windows 11，Go 1.27.3，gcc 16.2.0，
+C 侧编译选项 `-O3 -DNDEBUG -flto`（不含 `-march=native`）。
+
+自终止程序（fib、排序、筛法）跑到停机；死循环负载（pi、ALU、内存读写）给 2M 指令预算，
+连跑三次取最好的一次。短窗口对主机状态很敏感，这类数字按区间看。
+
+### 当前吞吐
+
+| 负载 | 指令数 | MIPS |
+|---|---:|---:|
+| fib(28) 递归 | 15,426,855 | ~383 |
+| pi（Leibniz，含 M 扩展除法） | 2,000,000 | ~532 |
+| ALU 紧循环 | 2,000,000 | ~531 |
+| 内存读写循环 | 2,000,000 | ~131 |
+| 冒泡排序循环 | 20,000,000 | ~105 |
+| 素数筛循环 | 20,000,000 | ~172 |
+| TinyOS 启动到 shell | 5,000,000 | ~348 |
+
+提速主要来自 `RunHot` 的基本块缓存和块链：之前逐条 `Step()` 的版本在 i9-11950H 上
+fib(28) 约 59.6 MIPS，现在同一负载在本机约 383 MIPS（主机不同，只看量级）。
+
+### 和 C 移植的对比
+
+`rv32emu-c` 是同一份设计的 C11 移植，独立仓库
+[yafengabc/RV32EMU-C](https://github.com/yafengabc/RV32EMU-C)。同一台机器、同一批镜像、
+同一套批次循环下：
+
+| 负载 | Go MIPS | C MIPS | C/Go |
+|---|---:|---:|---:|
+| fib(28) 递归 | ~383 | ~442 | 1.15x |
+| pi（Leibniz） | ~532 | ~548 | 1.03x |
+| ALU 紧循环 | ~531 | ~567 | 1.07x |
+| 内存读写循环 | ~131 | ~159 | 1.22x |
+| 冒泡排序循环 | ~105 | ~134 | 1.28x |
+| 素数筛循环 | ~172 | ~231 | 1.35x |
+| TinyOS 启动到 shell | ~348 | ~412 | 1.19x |
+
+- 总体 **1.03x ~ 1.35x**，访存/分支密集的负载差距最大。
+- 纯 ALU 和除法循环已基本追平：位域解析被块缓存摊掉之后，一个块里边界检查和接口调用
+  所剩无几；C 的余量主要来自 load/store 路径（`priv`/PMP/平铺区判断）和更紧凑的代码。
+- 两侧都会随主机状态波动（Go 的 pi 中位数见过 513~547 MIPS、筛法 158~173 MIPS），
+  比值按区间看，不要当成固定倍率。
+- 一键复现（需要 RV32EMU-C 仓库）：
+
+```powershell
+cd rv32emu-c
+.\bench\compare.ps1 -Reps 7 -IncludeTinyOS
+```
+
+### 与 Unicorn 2.1.4：旧表已作废
+
+早期 README 里那张 Unicorn 对比表（紧循环 13.8x、fib 2.0x、TinyGo 2.1x）是在另一台机器、
+另一版 Unicorn 上测的，用本仓库依赖的 MSYS2 包**复现不出来**：
+`mingw-w64-ucrt-x86_64-unicorn`（QEMU TCG，2.1.4）的 RISC-V 前端跑不了这些镜像——
+
+- 长 TB 里被跳转的分支会把**跳转目标**当成分支执行，随后在 TB 末尾抛 `UC_ERR_EXCEPTION`；
+- `EBREAK` 不被解码（`UC_ERR_INSN_INVALID`），`ECALL` 能进 `UC_HOOK_INTR`；
+- 越界 load/store 会悄悄落到相邻 4 KiB 页；
+- `uc_emu_start(..., count=N)` 在 TB 边界裁掉尾部分支，循环镜像直接跳出循环。
+
+能稳定跑的只有单页直线代码：16,000 条 `nop` 在 Python 绑定下约 0.018 s（≈0.9 MIPS），
+加 `UC_HOOK_CODE`（与 Go/C 一样逐条记账）掉到 0.74 MIPS；同一段代码 C 侧约 0.00003 s。
+也就是说在「每条指令都要记账」的口径下，JIT 并不占便宜。
+
+结论：那张表不再是有效参考。要么换成能正确执行 RISC-V 的 Unicorn/QEMU 版本重测，
+要么就以 Go vs C 的对比为准；复现方法和探针代码在 `rv32emu-c/bench/README.md`。
 
 ## TinyGo 固件验证
 
@@ -172,44 +251,59 @@ tinygo build -target=riscv-qemu -o bench.elf .
 
 ## C 移植版
 
-`rv32emu-c/` 是同一套 RV32IMC/ESP32-C3 模拟器的 C11 移植，保留平铺总线、
-基本块缓存、块链执行、PMP/trap 语义和全部外设模型。构建、运行与逐项速度对比
-见 `rv32emu-c/README.md`；一键复现：
+同一套 RV32IMC/ESP32-C3 模拟器的 C11 移植在独立仓库
+[yafengabc/RV32EMU-C](https://github.com/yafengabc/RV32EMU-C)：平铺总线、基本块缓存、
+块链执行、PMP/trap 语义和全部外设模型一一对应。逐项速度对比见上面的
+「和 C 移植的对比」，构建与运行见该仓库的 `README.md`。
 
-```powershell
-cd rv32emu-c
-.\bench\compare.ps1 -Reps 7 -IncludeTinyOS
-```
+## 当前边界
 
-在同一套 `RunHot(1000)` 计时口径下，C 版相对 Go 版快 **1.05x ~ 1.42x**
-（fib(28) 1.26x、ALU loop 1.15x、memory loop 1.31x、排序 1.31x、筛法 1.42x、
-TinyOS 启动 1.28x；紧循环抖动较大，C 在每次运行里都更快）。Unicorn 2.1.4 的
-RISC-V 前端跑不了这些带分支的镜像（长 TB 里被跳转的分支会执行跳转目标），
-对比过程和原因见 `rv32emu-c/bench/README.md`。
+### 指令集 / CPU
 
-## 当前边界 / 后续扩展
+- **RV32IMC**：I（`fence` 视为 nop）、M、C。没有 F/D，没有 A（原子指令按非法指令 trap），
+  也没有自定义扩展；C3 本身也没有这些。
+- 单核单 hart（`mhartid` 恒为 0）；只实现 M-mode + U-mode，没有 S-mode。
+- PMP：U-mode 必须命中允许条目，M-mode 直接放行（对齐真机，内核不设锁定位）；区间在
+  `pmpcfg/pmpaddr` 写入后惰性重建。
+- `mtvec` 强制按 vectored 处理（C3 硬件只支持这一种）：同步异常跳 base，中断跳
+  `base + 4*cause`。
+- 中断只有 TIMG0 一条（`mcause = 0x80000002`），没有 `mie` CSR，仅由 `mstatus.MIE` 门控。
+- `ebreak` 约定为停机，作为固件退出。
 
-- 外设覆盖 TinyOS 实际用到的部分：UART0、GPIO 影子、TIMG0 节拍、INTMTX
-  （被动影子）、SPI1 扇区擦除、USJ（黑洞）、RTC_CNTL（被动）、ROM flash 桩。
-  未建模的寄存器一律返回 0 并按地址去重告警，便于发现新缺口。
-- ROM 没有真机 dump：`esp_rom_spiflash_read/write/config_param` 用三条手写
-  RV32I 蹦床桩顶替（`internal/rom`），行为等价于「按字节 memcpy 到 flash 模拟区」。
-- 未做精确外设时序：tick 按「每 N 条指令」计，而不是墙钟。
-- **UART 接收中断没有建模**：真机上内核把 UART0 的 RX 中断路由到 INTMTX 的 CPU
-  line 3，是一条独立于 tick 的唤醒路径；这里 INTMTX 是被动影子，不会真的拉起
-  中断，所以输入走的是内核保留的 tick 轮询兜底。功能不受影响，只是输入延迟按
-  tick 量化。
-- 也正因如此，**真机上「粘贴长命令丢字节」那类问题在这里复现不出来**：管道的
-  写入速率没有 115200 的物理上限，tick 之间永远不会堆满 128 字节的接收 FIFO。
-- **用模拟器抓到并已修复的一个内核 bug**：`sched_switch` 选择任务与探测「还有人
-  在等吗」原本是两个可被 tick 打断的独立动作。`sched_idle()` 打开的中断之后不会
-  再关，所以从第一次 idle 起这个重试循环就是可抢占的；tick 若落在
-  `sched_pick()` 与 `proc_waiting()` 之间，扫描已经走过刚被唤醒的槽位（本轮不会
-  回头看 `rr` 之前）而返回 NULL，探测又因为该任务已变 `ST_READY` 而返回「没人等」，
-  两者相加就成了 `panic("no runnable process")` —— 机器上明明有一个能跑的 shell。
+### 内存 / 取指
 
-  确定性节拍让这个窗口可以从指令级复现（`-tickdiv 1` 必现，拉长周期即消失，
-  QEMU 因时序不同很少命中），这也是发现它的方法：`-traplog` + `-breakpc` 停在
-  panic 调用点 + `-dumpram` 快照，快照里 `procs[0]`(sh) 是 `ST_READY`，而代码
-  判定「无就绪」。TinyOS 侧修法是让选择与探测处于同一个关中断区间（commit
-  `dbe0e90`），不再需要 `-tickdiv` 兜底。
+- 只支持**扁平链接**的固件：从 `0x40000000` 起执行。ESP-IDF 默认把代码放在 flash 的
+  指令别名 `0x42000000`，这类镜像需要先重链接（TinyOS 就是扁平链接的）。
+- 没有 flash MMU/页映射，也没有 `0x3C000000` 数据别名；ELF 段按 paddr 直接铺进平铺区。
+- 未建模的地址：读返回 0、写丢弃，并按地址去重打印告警，便于发现新缺口。
+- 基本块缓存以 4 KiB 页为失效粒度，单块最多 32 条指令、512 个槽；写平铺区会 bump 所在页
+  的版本号，所以自修改代码和 SPI1 擦写 flash 都不会读到过期块。
+
+### 外设
+
+- 只覆盖 TinyOS 实际用到的部分：UART0、GPIO 影子、TIMG0、INTMTX（被动影子）、SPI1 扇区
+  擦除、USJ（黑洞）、RTC_CNTL（被动）；CLINT mtimer 是旧路径，C3 不用。
+- **UART 接收中断没有建模**：真机上内核把 UART0 RX 中断路由到 INTMTX 的 CPU line 3，是
+  一条独立于 tick 的唤醒路径；这里 INTMTX 不会真的拉中断，输入走内核保留的 tick 轮询兜底。
+  功能不受影响，输入延迟按 tick 量化。
+- 因此**真机上「粘贴长命令丢字节」那类问题复现不出来**：管道没有 115200 的物理上限，
+  tick 之间不会堆满 128 字节接收 FIFO。
+- 没有精确外设时序：tick 是「每 N 条指令」而不是墙钟，`-tickdiv` 用来验证时序敏感性。
+  看门狗、deep sleep/电源管理、USB-Serial-JTAG 协议都没有建模。
+- ROM 没有真机 dump：`esp_rom_spiflash_read/write/config_param` 是三条手写 RV32I 蹦床桩
+  （`internal/rom`），等价于「按字节 memcpy 到 flash 模拟区」。
+
+### 调试 / 工具
+
+- 没有 GDB stub。调试手段是快照式的：`-trace` / `-step` / `-traplog` / `-fault` /
+  `-breakpc` / `-watch` / `-traceirq` / `-dumpram`。
+- `-dumpram` 固定导出 `0x40380000..0x403AC000`（TinyOS 内核 RAM 窗口），换固件要改常量。
+- 性能数字只在同一台机器、同一份代码上可比；跨机器的绝对值不要直接对比。
+
+### 与真机的已知差异（时序类）
+
+- 中断延迟按指令数而不是周期数，单条指令的「耗时」是均匀的。
+- 没有总线竞争、cache、flash 等待周期，所以对时序敏感的竞态在模拟器里更「干净」。
+- 反过来，这种确定性可以用来复现竞态：TinyOS 的 `sched_switch` 丢任务 bug 就是靠
+  `-tickdiv 1` 必现 + `-traplog` + `-breakpc` + `-dumpram` 定位的（TinyOS 侧已修，
+  commit `dbe0e90`：把「选择任务」和「探测是否还有人等」放进同一个关中断区间）。
