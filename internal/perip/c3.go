@@ -42,14 +42,32 @@ type C3Timer struct {
 	div     uint32 // 计数分频：>1 时每 div 条指令才计一次（调 tick 周期用）
 	sub     uint32
 	regs    map[uint32]uint32
+
+	// TG0WDT（TIMG0 看门狗）。真机上 ROM 交出来时它是开着的，但本模拟器
+	// 的 ROM 是手写桩、没有那段初始化，所以上电默认关闭；固件要按真机
+	// 流程（解锁 WPROTECT → 写 CONFIG0 使能 → 定期 FEED）启用后才会计时。
+	// 1 条指令按 1 个 APB 周期计（与 tick 的换算一致）。
+	//
+	// 寄存器语义按 C3 的 MWDT：CONFIG0 是控制/各级动作，CONFIG1 是预分频
+	// （CLK_PRESCALE[31:16]），CONFIG2..5 才是 stage0..3 的超时值。
+	wdtCfg0     uint32 // CONFIG0 影子，bit31 = EN
+	wdtHold     uint32 // CONFIG2：stage0 超时值（MWDT 周期数）
+	wdtPrescale uint32 // CONFIG1：CLK_PRESCALE，默认 1
+	wdtCount    uint64
+	wdtUnlock   bool // WPROTECT 是否已用解锁字打开
+	wdtFires    uint64
+	wdtReset    bool // 超时触发系统复位（与 RTC SW_SYS_RST 共用重装路径）
 }
 
 func NewC3Timer(c *cpu.CPU) *C3Timer {
 	t := &C3Timer{
-		cpu:    c,
-		reload: 10000, // (80MHz/80)/100 = 10000 counts/tick，作为默认
-		div:    1,
-		regs:   make(map[uint32]uint32),
+		cpu:         c,
+		reload:      10000, // (80MHz/80)/100 = 10000 counts/tick，作为默认
+		div:         1,
+		wdtPrescale: 1,
+		// WKEY 复位值就是解锁字，所以复位后处于“未上锁”状态。
+		wdtUnlock: true,
+		regs:      map[uint32]uint32{t0WdtProtect: t0WdtProtectKey},
 	}
 	return t
 }
@@ -87,9 +105,12 @@ func (t *C3Timer) TickN(n uint64) {
 			return
 		}
 	}
+	t.tickWDT(n)
 	if t.reload == 0 { // 未设置报警值：按原语义每周期都触发
 		t.fires += n
-		t.cpu.SetPendingInt(c3TickCause)
+		if t.cpu != nil {
+			t.cpu.SetPendingInt(c3TickCause)
+		}
 		return
 	}
 	fires := uint64(0)
@@ -105,9 +126,78 @@ func (t *C3Timer) TickN(n uint64) {
 	}
 	if fires > 0 {
 		t.fires += fires
-		t.cpu.SetPendingInt(c3TickCause)
+		if t.cpu != nil {
+			t.cpu.SetPendingInt(c3TickCause)
+		}
 	}
 }
+
+// tickWDT 按周期推进 TG0WDT 的 stage0 计数。超时后只记一次复位请求，
+// 由主循环把整台机器重装（与 RTC_CNTL SW_SYS_RST 的处理一致）。
+func (t *C3Timer) tickWDT(n uint64) {
+	if t.wdtCfg0&t0WdtEn == 0 || t.wdtHold == 0 || t.wdtReset {
+		return
+	}
+	// stage0 超时值按 MWDT 周期计：一个 MWDT 周期 = prescale 个 APB 周期。
+	// 本模拟器把 1 条指令当作 1 个 APB 周期。
+	limit := uint64(t.wdtHold) * uint64(t.wdtPrescale)
+	if limit == 0 {
+		limit = uint64(t.wdtHold)
+	}
+	t.wdtCount += n
+	if t.wdtCount >= limit {
+		t.wdtCount = limit
+		t.wdtFires++
+		t.wdtReset = true
+	}
+}
+
+// WDTState 是供控制协议/GUI 使用的 TG0WDT 快照。
+type WDTState struct {
+	Enabled      bool   `json:"enabled"`
+	Stage0       uint32 `json:"stage0"`
+	Prescale     uint32 `json:"prescale"`
+	Fires        uint64 `json:"fires"`
+	ResetPending bool   `json:"resetPending"`
+}
+
+func (t *C3Timer) WDTState() WDTState {
+	return WDTState{
+		Enabled:      t.wdtCfg0&t0WdtEn != 0,
+		Stage0:       t.wdtHold,
+		Prescale:     t.wdtPrescale,
+		Fires:        t.wdtFires,
+		ResetPending: t.wdtReset,
+	}
+}
+
+// SetWDTEnabled 供控制协议（GUI）直接开关 TG0WDT，绕过 WPROTECT 解锁流程。
+// 打开时若 stage0 超时值还是 0（复位默认），补一个与 RTC WDT 默认值同量级
+// 的数，否则“开关”不会有任何可见效果。
+func (t *C3Timer) SetWDTEnabled(on bool) {
+	if on {
+		if t.wdtHold == 0 {
+			t.wdtHold = 200000
+		}
+		t.wdtCfg0 |= t0WdtEn
+		t.wdtCount = 0
+	} else {
+		t.wdtCfg0 &^= t0WdtEn
+		t.wdtCount = 0
+	}
+}
+
+// SetWDTHold 供控制协议设置 stage0 超时值（MWDT 周期数）。
+func (t *C3Timer) SetWDTHold(hold uint32) { t.wdtHold = hold }
+
+// FeedWDT 供控制协议喂狗。
+func (t *C3Timer) FeedWDT() { t.wdtCount = 0 }
+
+// WDTResetPending 报告 TG0WDT 已超时并要求系统复位。
+func (t *C3Timer) WDTResetPending() bool { return t.wdtReset }
+
+// WDTFires 返回 TG0WDT 超时次数（诊断用）。
+func (t *C3Timer) WDTFires() uint64 { return t.wdtFires }
 
 // Fires 返回定时器累计触发次数（诊断用）。
 func (t *C3Timer) Fires() uint64 { return t.fires }
@@ -120,7 +210,12 @@ const (
 	t0LoadLoReg  uint32 = 0x18
 	t0LoadHiReg  uint32 = 0x1C
 	t0LoadReg    uint32 = 0x20
-	t0WdtCfg0    uint32 = 0x48
+	t0WdtCfg0    uint32 = 0x48 // EN(bit31) + 各级动作选择
+	t0WdtCfg1    uint32 = 0x4C // 预分频：CLK_PRESCALE[31:16] + DIVCNT_RST(bit0)
+	t0WdtCfg2    uint32 = 0x50 // stage0 超时值（MWDT 周期数）
+	t0WdtCfg3    uint32 = 0x54 // stage1
+	t0WdtCfg4    uint32 = 0x58 // stage2
+	t0WdtCfg5    uint32 = 0x5C // stage3
 	t0WdtFeed    uint32 = 0x60
 	t0WdtProtect uint32 = 0x64
 	t0IntEna     uint32 = 0x70
@@ -133,6 +228,10 @@ const (
 	t0AlarmEn uint32 = 1 << 10
 	t0DivS    uint32 = 13
 	t0DivM    uint32 = 0xFFFF
+
+	t0WdtEn uint32 = 1 << 31 // CONFIG0 的 WDT_EN
+	// t0WdtProtectKey 是 WPROTECT 的解锁字：写入它之后 CONFIG0..5 才接受写入。
+	t0WdtProtectKey uint32 = 0x50D83AA1
 )
 
 func (t *C3Timer) Read(offset uint32, size uint32) uint32 {
@@ -159,7 +258,48 @@ func (t *C3Timer) Write(offset uint32, size uint32, val uint32) {
 		t.regs[offset] = val
 	case t0LoadReg:
 		t.counter = 0 // 任意写都 reload 到 0
-	case t0WdtCfg0, t0WdtFeed, t0WdtProtect, t0IntEna, t0IntClr, t0RegClk:
+	case t0WdtCfg0:
+		// CONFIG0..5 受 WPROTECT 保护，未解锁时写入被忽略（真机行为）。
+		if t.wdtUnlock {
+			if val&t0WdtEn != 0 && t.wdtCfg0&t0WdtEn == 0 {
+				t.wdtCount = 0 // 使能时从 0 开始计时
+			}
+			t.regs[offset] = val
+			t.wdtCfg0 = val
+			if val&t0WdtEn == 0 {
+				t.wdtCount = 0 // 关狗同时清计数
+			}
+		}
+	case t0WdtCfg1:
+		if t.wdtUnlock {
+			t.regs[offset] = val
+			// CLK_PRESCALE 为 0 时按 1 处理，避免除零/零超时。
+			if p := val >> 16; p != 0 {
+				t.wdtPrescale = p
+			} else {
+				t.wdtPrescale = 1
+			}
+			if val&1 != 0 { // WDT_DIVCNT_RST
+				t.wdtCount = 0
+			}
+		}
+	case t0WdtCfg2:
+		if t.wdtUnlock {
+			t.regs[offset] = val
+			t.wdtHold = val
+		}
+	case t0WdtCfg3, t0WdtCfg4, t0WdtCfg5:
+		if t.wdtUnlock {
+			t.regs[offset] = val // stage1..3 只做影子
+		}
+	case t0WdtFeed:
+		// FEED 不受 WPROTECT 保护：写任意值都把 stage0 计数清零。
+		t.regs[offset] = val
+		t.wdtCount = 0
+	case t0WdtProtect:
+		t.regs[offset] = val
+		t.wdtUnlock = val == t0WdtProtectKey
+	case t0IntEna, t0IntClr, t0RegClk:
 		t.regs[offset] = val
 	default:
 		fmt.Fprintf(os.Stderr, "[c3timg0] unhandled write off=0x%02X val=0x%08X\n", offset, val)

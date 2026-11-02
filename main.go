@@ -43,6 +43,7 @@ var (
 	tickDiv   = flag.Uint("tickdiv", 1, "stretch the timer period by this factor (timing-sensitivity tests)")
 	step      = flag.Int("step", 0, "execute N instructions then pause & dump regs")
 	dumpRAM   = flag.String("dumpram", "", "write kernel RAM image (0x40380000..0x403AC000) to this file at exit")
+	ctlMode   = flag.Bool("ctl", false, "control mode: JSON Lines protocol on stdin/stdout (for GUI frontends)")
 )
 
 func main() {
@@ -58,6 +59,16 @@ func main() {
 	// 复位而消失，`wfile` 写进去的文件重启后还在），所以在机器之外持有。
 	flash := make([]byte, flashSize)
 	copy(flash[flashOffset:], ramdiskImg)
+
+	// 控制模式：stdout 是协议通道，人类日志只走 stderr，所以这里不能打印。
+	// ELF/内存初始化等公共代码直接 fmt.Printf 到 os.Stdout，先把 os.Stdout
+	// 指到 stderr，再把真正的 stdout 留给协议写入。
+	if *ctlMode {
+		proto := os.Stdout
+		os.Stdout = os.Stderr
+		runCtl(proto, flash)
+		return
+	}
 
 	// UART 同理活过一次复位：它建模的是主机那一端（stdin 搬运协程、
 	// 尚未送进 FIFO 的字节）。芯片侧的 FIFO 在 machine 复位时清空。
@@ -82,6 +93,8 @@ type machine struct {
 	uart  *perip.UART
 	rtc   *perip.RTC
 	timer *perip.C3Timer
+	gpio  *perip.GPIO
+	adc   *perip.ADC
 }
 
 func newMachine(flash []byte, uart *perip.UART) *machine {
@@ -89,10 +102,12 @@ func newMachine(flash []byte, uart *perip.UART) *machine {
 	gpio := perip.NewGPIO()
 	usj := perip.NewUSJ()
 	rtc := perip.NewRTC()
+	adc := perip.NewADC()
 	bus.Attach(mem.DeviceRange{Base: perip.UART0Base, Size: perip.UARTSize, Dev: uart})
 	bus.Attach(mem.DeviceRange{Base: perip.GPIOBase, Size: perip.GPIOSize, Dev: gpio})
 	bus.Attach(mem.DeviceRange{Base: perip.USJBase, Size: perip.USJSize, Dev: usj})
 	bus.Attach(mem.DeviceRange{Base: perip.RTCBase, Size: perip.RTCSize, Dev: rtc})
+	bus.Attach(mem.DeviceRange{Base: perip.ADCBase, Size: perip.ADCSize, Dev: adc})
 
 	// flash 模拟区：ROM 桩把 (FlashEmuBase + flash_addr) 当物理 flash。
 	bus.AddRAM(perip.FlashEmuBase, flashSize)
@@ -144,7 +159,7 @@ func newMachine(flash []byte, uart *perip.UART) *machine {
 		os.Exit(2)
 	}
 
-	return &machine{bus: bus, cpu: c, uart: uart, rtc: rtc, timer: c3timer}
+	return &machine{bus: bus, cpu: c, uart: uart, rtc: rtc, timer: c3timer, gpio: gpio, adc: adc}
 }
 
 // flashSnapshot 取回 flash 模拟区的当前内容，供复位后灌进新总线。
@@ -237,6 +252,7 @@ func (m *machine) run() bool {
 			break
 		}
 		m.timer.TickN(ran)
+		m.rtc.Tick(ran)
 		// 控制台输入按 tick 分批放行（见 UART.RxFeed 的注释）。
 		// -rxdelay 让脚本输入等 shell 起来再喂：内核行规程只有 8 行队
 		// 列，boot 期间灌进去的预输入超过 8 行就会按设计丢行。
@@ -253,6 +269,18 @@ func (m *machine) run() bool {
 			}
 		}
 		n += ran
+		// 看门狗超时 / 软件复位：真机上都是整颗芯片复位（SRAM、外设、
+		// CPU 全部重来），模拟器这边对应的做法就是重装一台机器。
+		if m.timer.WDTResetPending() {
+			fmt.Printf("\n=== watchdog reset after %d inst (TIMG0 TG0WDT timeout) ===\n", n)
+			m.uart.Reset()
+			return true
+		}
+		if m.rtc.WDTResetPending() {
+			fmt.Printf("\n=== watchdog reset after %d inst (RTC WDT timeout) ===\n", n)
+			m.uart.Reset()
+			return true
+		}
 		// 软件复位：内核写完 RTC_CNTL 就会一直自旋等到复位生效，模拟器
 		// 这边没有比「重装一台机器」更准确的做法。批量执行只影响
 		// 这一步晚几条指令被发现，内核在自旋里等，无所谓。

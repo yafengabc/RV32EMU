@@ -16,13 +16,13 @@ const (
 
 // UART 寄存器偏移（只实现控制台最小子集）。
 const (
-	uartFifo    uint32 = 0x00
-	uartIntRaw  uint32 = 0x04
-	uartIntSt   uint32 = 0x08
-	uartIntEna  uint32 = 0x0C
-	uartIntClr  uint32 = 0x10
-	uartClkdiv  uint32 = 0x14
-	uartStatus  uint32 = 0x1C
+	uartFifo   uint32 = 0x00
+	uartIntRaw uint32 = 0x04
+	uartIntSt  uint32 = 0x08
+	uartIntEna uint32 = 0x0C
+	uartIntClr uint32 = 0x10
+	uartClkdiv uint32 = 0x14
+	uartStatus uint32 = 0x1C
 )
 
 // UART0：TX FIFO 写一个字节即输出到模拟器 stdout；RX 由后台协程把
@@ -38,16 +38,56 @@ type UART struct {
 	rxBuf bytes.Buffer // RX FIFO 里可被内核读走的字节
 	// rxStop 关闭以停掉旧的 RX 搬运协程
 	rxStop chan struct{}
+
+	txBytes uint64 // 写进 TX FIFO 的字节数（诊断/UI）
+	rxBytes uint64 // 从 RX FIFO 被内核读走的字节数
 }
 
 // RxFIFOMax 是硬件 RX FIFO 的深度（C3 为 128 字节）。
 const RxFIFOMax = 128
 
+// NewUART 创建一个不接 stdin/stdout 的 UART：供控制协议（GUI）注入
+// TX 输出与 RX 输入时使用，避免后台协程抢读进程的 stdin。
+func NewUART() *UART {
+	return &UART{tx: io.Discard}
+}
+
+// NewUART0 是 CLI 默认构造：TX 写 stdout，RX 由后台协程从 stdin 搬运。
 func NewUART0() *UART {
-	u := &UART{tx: os.Stdout, rx: os.Stdin}
-	u.startRX(os.Stdin)
+	u := &UART{}
+	u.SetIO(os.Stdout, os.Stdin)
 	return u
 }
+
+// SetSink 替换 TX 输出去向。应在模拟开始前调用。
+func (u *UART) SetSink(tx io.Writer) {
+	if tx == nil {
+		tx = io.Discard
+	}
+	u.tx = tx
+}
+
+// PushRX 把主机侧输入直接放进“尚未进入 FIFO”的缓冲；
+// 之后由 RxFeed 按硬件深度分批搬进 RX FIFO。
+func (u *UART) PushRX(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	u.mu.Lock()
+	u.rxIn.Write(p)
+	u.mu.Unlock()
+}
+
+// RXFIFOLevel 返回当前 RX FIFO 中待内核读取的字节数。
+func (u *UART) RXFIFOLevel() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.rxBuf.Len()
+}
+
+// TXBytes / RXBytes 返回累计搬运字节数（诊断/UI）。
+func (u *UART) TXBytes() uint64 { return u.txBytes }
+func (u *UART) RXBytes() uint64 { return u.rxBytes }
 
 // SetIO 注入测试用 IO：停掉旧 RX 协程，改从给定 reader 搬运。
 func (u *UART) SetIO(tx io.Writer, rx io.Reader) {
@@ -59,6 +99,10 @@ func (u *UART) SetIO(tx io.Writer, rx io.Reader) {
 func (u *UART) startRX(src io.Reader) {
 	if u.rxStop != nil {
 		close(u.rxStop)
+		u.rxStop = nil
+	}
+	if src == nil {
+		return
 	}
 	u.rxStop = make(chan struct{})
 	stop := u.rxStop
@@ -118,6 +162,9 @@ func (u *UART) Read(offset uint32, size uint32) uint32 {
 	case uartFifo:
 		u.mu.Lock()
 		b, err := u.rxBuf.ReadByte()
+		if err == nil {
+			u.rxBytes++
+		}
 		u.mu.Unlock()
 		if err == nil {
 			return uint32(b)
@@ -147,7 +194,9 @@ func (u *UART) Write(offset uint32, size uint32, val uint32) {
 	switch offset {
 	case uartFifo:
 		c := byte(val)
-		_, _ = u.tx.Write([]byte{c})
+		if _, err := u.tx.Write([]byte{c}); err == nil {
+			u.txBytes++
+		}
 	case uartIntEna:
 		// 影子存储，无副作用
 	case uartIntClr:

@@ -301,15 +301,21 @@ tinygo build -target=riscv-qemu -o bench.elf .
 
 ### 外设
 
-- 只覆盖 TinyOS 实际用到的部分：UART0、GPIO 影子、TIMG0、INTMTX（被动影子）、SPI1 扇区
-  擦除、USJ（黑洞）、RTC_CNTL（被动）；CLINT mtimer 是旧路径，C3 不用。
+- 只覆盖 TinyOS 实际用到的部分：UART0、GPIO 影子、TIMG0（T0 节拍 + TG0WDT）、
+  INTMTX（被动影子）、SPI1 扇区擦除、USJ（黑洞）、RTC_CNTL（被动）；CLINT mtimer
+  是旧路径，C3 不用。
 - **UART 接收中断没有建模**：真机上内核把 UART0 RX 中断路由到 INTMTX 的 CPU line 3，是
   一条独立于 tick 的唤醒路径；这里 INTMTX 不会真的拉中断，输入走内核保留的 tick 轮询兜底。
   功能不受影响，输入延迟按 tick 量化。
 - 因此**真机上「粘贴长命令丢字节」那类问题复现不出来**：管道没有 115200 的物理上限，
   tick 之间不会堆满 128 字节接收 FIFO。
 - 没有精确外设时序：tick 是「每 N 条指令」而不是墙钟，`-tickdiv` 用来验证时序敏感性。
-  看门狗、deep sleep/电源管理、USB-Serial-JTAG 协议都没有建模。
+- **看门狗只建模了 TG0WDT（TIMG0）**，语义按真机：`WPROTECT` 写入解锁字 `0x50D83AA1`
+  之后 `CONFIG0..5` 才接受写入；`CONFIG1` 是 stage0 超时值（按指令数计，1 条指令 ≈
+  1 个 APB 周期），`FEED` 写任意值清零计数；超时按整机复位处理（和 `reboot` 共用
+  重装路径，打印 `=== watchdog reset ... ===`）。上电默认关闭——本模拟器的 ROM 是
+  手写桩，没有真 ROM 打开看门狗的那段初始化。RTC WDT / super WDT 仍只是寄存器影子
+  （接受写入与读回，不参与复位）。deep sleep/电源管理、USB-Serial-JTAG 协议没有建模。
 - ROM 没有真机 dump：`esp_rom_spiflash_read/write/config_param` 是三条手写 RV32I 蹦床桩
   （`internal/rom`），等价于「按字节 memcpy 到 flash 模拟区」。
 
