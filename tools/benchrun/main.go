@@ -17,6 +17,7 @@ import (
 	"rv32emu/internal/mem"
 	"rv32emu/internal/perip"
 	"rv32emu/internal/rom"
+	"rv32emu/internal/soc"
 )
 
 func main() {
@@ -30,14 +31,19 @@ func main() {
 		os.Exit(2)
 	}
 
-	flash := make([]byte, 0x400000)
+	var img []byte
 	if *ramdisk != "" {
-		img, err := os.ReadFile(*ramdisk)
+		var err error
+		img, err = os.ReadFile(*ramdisk)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "ramdisk:", err)
 			os.Exit(1)
 		}
-		copy(flash[0x100000:], img)
+	}
+	flash, err := soc.NewFlash(img, soc.DefaultFlashOffset)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "flash:", err)
+		os.Exit(1)
 	}
 
 	run := func() (uint64, float64) {
@@ -50,19 +56,36 @@ func main() {
 		bus.Attach(mem.DeviceRange{Base: perip.GPIOBase, Size: perip.GPIOSize, Dev: gpio})
 		bus.Attach(mem.DeviceRange{Base: perip.USJBase, Size: perip.USJSize, Dev: usj})
 		bus.Attach(mem.DeviceRange{Base: perip.RTCBase, Size: perip.RTCSize, Dev: rtc})
+		bus.Attach(mem.DeviceRange{Base: perip.EFUSEBase, Size: perip.EFUSESize, Dev: perip.NewEFUSE()})
 		bus.AddRAM(perip.FlashEmuBase, 0x400000)
 		bus.CopyInto(perip.FlashEmuBase, 0, flash)
 		bus.LoadROM(0, rom.BuildROM())
 
 		timer := perip.NewC3Timer(nil)
 		intc := perip.NewC3Intc()
+		systimer := perip.NewSysTimer()
 		spi1 := perip.NewC3SPI1(bus, perip.FlashEmuBase)
 		bus.Attach(mem.DeviceRange{Base: perip.TIMG0Base, Size: perip.TIMG0Size, Dev: timer})
+		bus.Attach(mem.DeviceRange{Base: perip.SysTimerBase, Size: perip.SysTimerSize, Dev: systimer})
 		bus.Attach(mem.DeviceRange{Base: perip.INTMTXBase, Size: perip.INTMTXSize, Dev: intc})
-		bus.Attach(mem.DeviceRange{Base: perip.SPI1Base, Size: perip.SPI1Size, Dev: spi1})
+		bus.Attach(mem.DeviceRange{Base: perip.SPI1Base, Size: perip.SPISize, Dev: spi1})
+
+		// 与 soc.New 保持一致：UART1/SPI2/I2C0 + 寄存器影子窗口。
+		perip.NewExtras(bus, intc)
+
+		// flash cache（XIP）+ SPI0，与 soc.New 保持一致（必须在加载 ELF 前挂好）。
+		mmu := perip.NewFlashMMU(bus, perip.FlashEmuBase, 0x400000)
+		bus.Attach(mem.DeviceRange{Base: perip.CacheRegBase, Size: perip.CacheRegSize, Dev: perip.NewCacheCtrl(mmu)})
+		bus.Attach(mem.DeviceRange{Base: perip.DROMBase, Size: perip.XIPWindowSize, Dev: perip.NewXIPWindow(mmu, perip.DROMBase, "DROM")})
+		bus.Attach(mem.DeviceRange{Base: perip.IROMBase, Size: perip.XIPWindowSize, Dev: perip.NewXIPWindow(mmu, perip.IROMBase, "IROM")})
+		spi0 := perip.NewC3SPI0(bus, perip.FlashEmuBase)
+		bus.Attach(mem.DeviceRange{Base: perip.SPI0Base, Size: perip.SPISize, Dev: spi0})
 
 		c := cpu.New(bus)
 		timer.SetCPU(c)
+		intc.SetCPU(c)
+		systimer.SetIntc(intc)
+		uart.SetIntc(intc)
 		entry, err := elf.Load(*elfPath, bus)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "elf:", err)
@@ -82,6 +105,7 @@ func main() {
 				break
 			}
 			timer.TickN(ran)
+			systimer.TickN(ran)
 			n += ran
 			if rtc.ResetPending() {
 				break

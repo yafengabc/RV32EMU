@@ -128,7 +128,7 @@ func (b *SystemBus) ExtendRAM(base uint32, need uint32) {
 	b.AddRAM(base, need)
 }
 
-// MapSize 返回某地址所在动态 RAM 区的大小，未映射返回 0。
+// RamSizeAt 返回某地址所在动态 RAM 区的大小，未映射返回 0。
 func (b *SystemBus) RamSizeAt(addr uint32) uint32 {
 	for _, r := range b.rams {
 		if addr >= r.base && addr < r.base+uint32(len(r.data)) {
@@ -137,6 +137,10 @@ func (b *SystemBus) RamSizeAt(addr uint32) uint32 {
 	}
 	return 0
 }
+
+// HasDeviceAt 报告 addr 是否落在已挂载的 MMIO 外设上。
+// ELF 加载器用它跳过 XIP 窗口这类设备段，避免再分配 RAM 把外设挡住。
+func (b *SystemBus) HasDeviceAt(addr uint32) bool { return b.devAt(addr) != nil }
 
 // Attach 挂载一个外设到总线上。
 func (b *SystemBus) Attach(r DeviceRange) {
@@ -259,7 +263,7 @@ func (b *SystemBus) LoadROM(off uint32, data []byte) {
 }
 
 // CopyInto 把 data 拷入基址为 base 的已挂载动态 RAM 区，从区内的 off 偏移开始。
-// 用于把 ramdisk 镜像放进 flash 模拟区（如 base=FlashEmuBase, off=0x100000）。
+// 用于把 ramdisk 镜像放进 flash 模拟区（如 base=FlashEmuBase, off=0x80000）。
 func (b *SystemBus) CopyInto(base, off uint32, data []byte) {
 	for _, r := range b.rams {
 		if r.base == base {

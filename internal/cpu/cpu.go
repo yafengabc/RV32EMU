@@ -54,6 +54,11 @@ type CPU struct {
 	// OnTrap 非空时，每次进入 trap 都会被回调（调试用）。
 	OnTrap func(cause, epc, tval uint32)
 
+	// RomCall 非空时，在 ROM 区（[0x40000000,0x40080000)）取到非法指令
+	// 不再进 trap，而是按当前 pc 分派给 Go 实现的 ROM 函数，执行完返回到 ra。
+	// 模拟器没有真实 ROM 镜像，MicroPython/IDF 引用的 ROM 函数靠这条路径补充。
+	RomCall func(c *CPU, addr uint32)
+
 	halted  bool
 	haltMsg string
 
@@ -106,7 +111,15 @@ func (c *CPU) SetPMPEnforce(v bool) { c.pmpEnforce = v }
 
 // SetPendingInt 由外设写入一个挂起中断的 mcause（含 IRQ 位，如
 // C3 定时器上报 0x80000002）。Step 在取指前采样，MIE 开时投递。
-func (c *CPU) SetPendingInt(cause uint32) { c.pendingInt = cause }
+//
+// 若已有一条挂起中断且 cause 不同，这里保留已有的那条：INTMTX 的源是电平，
+// 被挤掉的那条在源保持期间会被下一次 Deliver 重新投递，不会丢失；若直接
+// 覆盖，高频的跨核 yield 中断会把 tick 饿死。
+func (c *CPU) SetPendingInt(cause uint32) {
+	if c.pendingInt == 0 {
+		c.pendingInt = cause
+	}
+}
 
 // SetTimerPending 兼容旧接口：仍回填 MTIP（无实际中断路径使用）。
 func (c *CPU) SetTimerPending(b bool) {

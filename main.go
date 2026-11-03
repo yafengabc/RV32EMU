@@ -4,21 +4,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
 	"rv32emu/internal/cpu"
 	"rv32emu/internal/debug"
-	"rv32emu/internal/elf"
 	"rv32emu/internal/mem"
 	"rv32emu/internal/perip"
-	"rv32emu/internal/rom"
+	"rv32emu/internal/soc"
 )
 
 // TinyOS C3 构建产物的默认位置（可用 -elf / -ramdisk 覆盖）。
 const (
 	defaultELF     = `C:\Users\SONG\Documents\Projects\TinyOS\build\kernel-esp32c3.elf`
 	defaultRamdisk = `C:\Users\SONG\Documents\Projects\TinyOS\build\ramdisk-esp32c3.bin`
-	flashOffset    = 0x100000 // littlefs 分区在 flash 偏移 0x100000
-	flashSize      = 0x400000 // 4 MiB，与芯片一致
 )
 
 var (
@@ -26,6 +25,8 @@ var (
 	binPath   = flag.String("bin", "", "raw .bin to load")
 	entry     = flag.Uint("entry", 0x40000000, "entry/load base when using -bin")
 	ramdisk   = flag.String("ramdisk", defaultRamdisk, "littlefs ramdisk image (flash partition)")
+	flashImg  = flag.String("flashimg", "", "raw SPI flash image; boots the app found by its partition table")
+	flashOff  = flag.String("flashoff", "0x80000", "ramdisk offset in flash (decimal or 0x hex, default 512 KiB)")
 	max       = flag.Uint64("max", 0, "max instructions (0=until halt)")
 	trace     = flag.Bool("trace", false, "print each executed instruction (pc + disasm)")
 	traceFrom = flag.Uint64("tracefrom", 0, "only trace after this instruction index")
@@ -49,16 +50,40 @@ var (
 func main() {
 	flag.Parse()
 
-	ramdiskImg, err := os.ReadFile(*ramdisk)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load ramdisk: %v\n", err)
-		os.Exit(1)
-	}
-
 	// flash 是复位后唯一留下来的东西（真机上 SPI flash 的字节不会因为
 	// 复位而消失，`wfile` 写进去的文件重启后还在），所以在机器之外持有。
-	flash := make([]byte, flashSize)
-	copy(flash[flashOffset:], ramdiskImg)
+	var flash []byte
+	if *flashImg != "" {
+		// 直接给整片 flash：bootloader、分区表、应用都在里面，由 soc 按
+		// 分区表加载应用（等价于二级引导）。
+		img, err := os.ReadFile(*flashImg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load flash image: %v\n", err)
+			os.Exit(1)
+		}
+		flash, err = soc.NewFlash(img, 0)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "flash:", err)
+			os.Exit(1)
+		}
+	} else {
+		ramdiskImg, err := os.ReadFile(*ramdisk)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load ramdisk: %v\n", err)
+			os.Exit(1)
+		}
+		off, err := parseFlashOffset(*flashOff)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		flash, err = soc.NewFlash(ramdiskImg, off)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "flash:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("[flash] ramdisk %d bytes @0x%08X\n", len(ramdiskImg), perip.FlashEmuBase+off)
+	}
 
 	// 控制模式：stdout 是协议通道，人类日志只走 stderr，所以这里不能打印。
 	// ELF/内存初始化等公共代码直接 fmt.Printf 到 os.Stdout，先把 os.Stdout
@@ -74,105 +99,58 @@ func main() {
 	// 尚未送进 FIFO 的字节）。芯片侧的 FIFO 在 machine 复位时清空。
 	uart := perip.NewUART0()
 
-	fmt.Printf("[flash] ramdisk %d bytes @0x%08X\n", len(ramdiskImg), perip.FlashEmuBase+flashOffset)
+	if *flashImg != "" {
+		fmt.Printf("[flash] image %s\n", *flashImg)
+	}
 	for boot := 1; ; boot++ {
-		m := newMachine(flash, uart)
-		if !m.run() {
+		m, err := soc.New(flash, uart, soc.Config{
+			ELFPath:    *elfPath,
+			BinPath:    *binPath,
+			Entry:      uint32(*entry),
+			FlashImage: *flashImg != "",
+			NoPMP:      *noPMP,
+			TickDiv:    uint32(*tickDiv),
+			OnTrap:     trapLogger(),
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if !run(m) {
 			break
 		}
-		flash = m.flashSnapshot()
+		flash = m.FlashSnapshot()
 		fmt.Printf("=== rebooting (boot #%d) ===\n", boot+1)
 	}
 }
 
-// machine 是一台「通电」的 C3：总线、CPU、外设。复位 = 重装一台新的，
-// 只有 flash 内容和主机侧的控制台输入从上一次带过来。
-type machine struct {
-	bus   *mem.SystemBus
-	cpu   *cpu.CPU
-	uart  *perip.UART
-	rtc   *perip.RTC
-	timer *perip.C3Timer
-	gpio  *perip.GPIO
-	adc   *perip.ADC
+// parseFlashOffset 解析 -flashoff：支持十进制与 0x 十六进制写法。
+func parseFlashOffset(s string) (uint32, error) {
+	v, err := strconv.ParseUint(strings.TrimSpace(s), 0, 32)
+	if err != nil {
+		return 0, fmt.Errorf("bad -flashoff %q: %w", s, err)
+	}
+	return uint32(v), nil
 }
 
-func newMachine(flash []byte, uart *perip.UART) *machine {
-	bus := mem.NewSystemBus()
-	gpio := perip.NewGPIO()
-	usj := perip.NewUSJ()
-	rtc := perip.NewRTC()
-	adc := perip.NewADC()
-	bus.Attach(mem.DeviceRange{Base: perip.UART0Base, Size: perip.UARTSize, Dev: uart})
-	bus.Attach(mem.DeviceRange{Base: perip.GPIOBase, Size: perip.GPIOSize, Dev: gpio})
-	bus.Attach(mem.DeviceRange{Base: perip.USJBase, Size: perip.USJSize, Dev: usj})
-	bus.Attach(mem.DeviceRange{Base: perip.RTCBase, Size: perip.RTCSize, Dev: rtc})
-	bus.Attach(mem.DeviceRange{Base: perip.ADCBase, Size: perip.ADCSize, Dev: adc})
-
-	// flash 模拟区：ROM 桩把 (FlashEmuBase + flash_addr) 当物理 flash。
-	bus.AddRAM(perip.FlashEmuBase, flashSize)
-	bus.CopyInto(perip.FlashEmuBase, 0, flash)
-
-	// ROM 桩：实现 esp_rom_spiflash_read/write/config_param。
-	bus.LoadROM(0, rom.BuildROM())
-
-	// C3 私有外设：TIMG0 定时器 + INTMTX + SPI1（硬件擦除）。
-	c3timer := perip.NewC3Timer(nil) // cpu 在 New 后补设
-	c3intc := perip.NewC3Intc()
-	c3spi1 := perip.NewC3SPI1(bus, perip.FlashEmuBase)
-	bus.Attach(mem.DeviceRange{Base: perip.TIMG0Base, Size: perip.TIMG0Size, Dev: c3timer})
-	bus.Attach(mem.DeviceRange{Base: perip.INTMTXBase, Size: perip.INTMTXSize, Dev: c3intc})
-	bus.Attach(mem.DeviceRange{Base: perip.SPI1Base, Size: perip.SPI1Size, Dev: c3spi1})
-
-	c := cpu.New(bus)
-	if *noPMP {
-		c.SetPMPEnforce(false)
+// trapLogger 在 -traplog 下把同步 trap 打到 stderr 之外的标准输出。
+func trapLogger() func(cause, epc, tval uint32) {
+	if !*trapLog {
+		return nil
 	}
-	if *trapLog {
-		c.OnTrap = func(cause, epc, tval uint32) {
-			// ecall 是正常系统调用路径，只关心真正的故障。
-			if cause&0x80000000 != 0 || cause == 8 || cause == 11 {
-				return
-			}
-			fmt.Printf("[trap] cause=%d mepc=0x%08X mtval=0x%08X\n", cause, epc, tval)
+	return func(cause, epc, tval uint32) {
+		// ecall 是正常系统调用路径，只关心真正的故障。
+		if cause&0x80000000 != 0 || cause == 8 || cause == 11 {
+			return
 		}
+		fmt.Printf("[trap] cause=%d mepc=0x%08X mtval=0x%08X\n", cause, epc, tval)
 	}
-	c3timer.SetCPU(c)
-	c3timer.SetDiv(uint32(*tickDiv))
-
-	if *elfPath != "" {
-		e, err := elf.Load(*elfPath, bus)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "load elf:", err)
-			os.Exit(1)
-		}
-		c.SetPC(e)
-	} else if *binPath != "" {
-		if err := elf.LoadBin(*binPath, uint32(*entry), bus); err != nil {
-			fmt.Fprintln(os.Stderr, "load bin:", err)
-			os.Exit(1)
-		}
-		c.SetPC(uint32(*entry))
-	} else {
-		fmt.Fprintln(os.Stderr, "need -elf or -bin")
-		flag.Usage()
-		os.Exit(2)
-	}
-
-	return &machine{bus: bus, cpu: c, uart: uart, rtc: rtc, timer: c3timer, gpio: gpio, adc: adc}
-}
-
-// flashSnapshot 取回 flash 模拟区的当前内容，供复位后灌进新总线。
-func (m *machine) flashSnapshot() []byte {
-	buf := make([]byte, flashSize)
-	m.bus.CopyOut(perip.FlashEmuBase, buf)
-	return buf
 }
 
 // run 执行到停机、指令上限或一次软件复位。返回 true 表示内核请求了复位
 // （RTC_CNTL SW_SYS_RST），调用方应当重装机器。
-func (m *machine) run() bool {
-	c := m.cpu
+func run(m *soc.SoC) bool {
+	c := m.CPU
 
 	limit := *max
 	if *step > 0 {
@@ -194,6 +172,12 @@ func (m *machine) run() bool {
 	ring := make([]ringEnt, 48)
 	irqBudget := 0
 	irqArmed := false
+	// 单步调试时 SYSTIMER 每个周期都走一格，固件读 VAL_HI/VAL_LO 再回读
+	// VAL_LO 检测翻转的循环会因为两次读之间必然跨过一次计数而永远退不出去。
+	// 批量模式没有这个问题（一批指令内计数不变），所以只在非批量模式下
+	// 按 8 条指令折 1 个计数（固件回读循环的两条 VAL_LO 之间隔 4 条指令，
+	// 分频必须大于 4 才不会每次回读都跨过计数），模拟 CPU 高于计数器时钟。
+	var sysAcc uint64
 	for !c.Halted() && (limit == 0 || n < limit) {
 		// -traceirq：以 PC 进入 trap 向量为触发条件（中断投递瞬间），
 		// 追踪接下来 N 条指令，观察 向量 → trap_entry → trap_handler
@@ -212,9 +196,9 @@ func (m *machine) run() bool {
 			}
 		}
 		if *trace || (*traceFrom > 0 && n >= *traceFrom && (*traceTo == 0 || n < *traceTo)) {
-			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, m.bus))
+			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, m.Bus))
 		} else if irqBudget > 0 {
-			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, m.bus))
+			fmt.Printf("[%6d] pc=0x%08X  %s\n", n, c.PC(), disasmAt(c, m.Bus))
 			irqBudget--
 		}
 		if *fault {
@@ -223,7 +207,7 @@ func (m *machine) run() bool {
 		if *breakPC != 0 && uint64(c.PC()) == *breakPC {
 			fmt.Printf("\n=== break at pc=0x%08X (inst %d) ===\n", c.PC(), n)
 			fmt.Print(c.Dump())
-			m.writeRAMDump()
+			writeRAMDump(m)
 			return false
 		}
 		excBefore := c.ExcCount()
@@ -241,7 +225,7 @@ func (m *machine) run() bool {
 			c.Step()
 			if c.Reg(*watch) != oldv {
 				fmt.Printf("[%6d] pc=0x%08X  x%d: 0x%08X -> 0x%08X  %s\n",
-					n, oldpc, *watch, oldv, c.Reg(*watch), disasmAtPC(oldpc, m.bus))
+					n, oldpc, *watch, oldv, c.Reg(*watch), disasmAtPC(oldpc, m.Bus))
 			}
 			ran = 1
 		default:
@@ -251,8 +235,17 @@ func (m *machine) run() bool {
 		if ran == 0 {
 			break
 		}
-		m.timer.TickN(ran)
-		m.rtc.Tick(ran)
+		m.Timer.TickN(ran)
+		if bulk {
+			m.SysTimer.TickN(ran)
+		} else {
+			sysAcc += ran
+			if sysAcc >= 8 {
+				m.SysTimer.TickN(sysAcc / 8)
+				sysAcc %= 8
+			}
+		}
+		m.RTC.Tick(ran)
 		// 控制台输入按 tick 分批放行（见 UART.RxFeed 的注释）。
 		// -rxdelay 让脚本输入等 shell 起来再喂：内核行规程只有 8 行队
 		// 列，boot 期间灌进去的预输入超过 8 行就会按设计丢行。
@@ -265,28 +258,28 @@ func (m *machine) run() bool {
 			// 原本是"指令序号 n 为 p 的倍数时放行一次"；批量执行时
 			// 把本批覆盖到的所有放行点一次补齐。
 			for k := (n + p - 1) / p; k <= (n+ran-1)/p; k++ {
-				m.uart.RxFeed(*rxRate)
+				m.UART.RxFeed(*rxRate)
 			}
 		}
 		n += ran
 		// 看门狗超时 / 软件复位：真机上都是整颗芯片复位（SRAM、外设、
 		// CPU 全部重来），模拟器这边对应的做法就是重装一台机器。
-		if m.timer.WDTResetPending() {
+		if m.Timer.WDTResetPending() {
 			fmt.Printf("\n=== watchdog reset after %d inst (TIMG0 TG0WDT timeout) ===\n", n)
-			m.uart.Reset()
+			m.UART.Reset()
 			return true
 		}
-		if m.rtc.WDTResetPending() {
+		if m.RTC.WDTResetPending() {
 			fmt.Printf("\n=== watchdog reset after %d inst (RTC WDT timeout) ===\n", n)
-			m.uart.Reset()
+			m.UART.Reset()
 			return true
 		}
 		// 软件复位：内核写完 RTC_CNTL 就会一直自旋等到复位生效，模拟器
 		// 这边没有比「重装一台机器」更准确的做法。批量执行只影响
 		// 这一步晚几条指令被发现，内核在自旋里等，无所谓。
-		if m.rtc.ResetPending() {
+		if m.RTC.ResetPending() {
 			fmt.Printf("\n=== software reset after %d inst (RTC_CNTL SW_SYS_RST) ===\n", n)
-			m.uart.Reset()
+			m.UART.Reset()
 			return true
 		}
 		if *fault && c.ExcCount() > excBefore {
@@ -298,7 +291,7 @@ func (m *machine) run() bool {
 			for k := start; k < n; k++ {
 				e := ring[k%48]
 				if e.pc != 0 {
-					fmt.Printf("[%6d] pc=0x%08X  %s\n", e.n, e.pc, disasmAtPC(e.pc, m.bus))
+					fmt.Printf("[%6d] pc=0x%08X  %s\n", e.n, e.pc, disasmAtPC(e.pc, m.Bus))
 				}
 			}
 			fmt.Print(c.Dump())
@@ -308,8 +301,8 @@ func (m *machine) run() bool {
 
 	fmt.Printf("\n=== stopped after %d inst, reason=%q ===\n", n, c.HaltMsg())
 	fmt.Printf("=== irq: timg0 fires=%d, cpu interrupts=%d, exceptions=%d ===\n",
-		m.timer.Fires(), c.IntCount(), c.ExcCount())
-	m.writeRAMDump()
+		m.Timer.Fires(), c.IntCount(), c.ExcCount())
+	writeRAMDump(m)
 	if *step > 0 || c.Halted() {
 		fmt.Print(c.Dump())
 	}
@@ -317,13 +310,13 @@ func (m *machine) run() bool {
 }
 
 // writeRAMDump 在 -dumpram 下把内核 RAM 落盘（调试用）。
-func (m *machine) writeRAMDump() {
+func writeRAMDump(m *soc.SoC) {
 	if *dumpRAM == "" {
 		return
 	}
 	const dumpBase, dumpLen = 0x40380000, 0x2C000
 	buf := make([]byte, dumpLen)
-	m.bus.CopyOut(dumpBase, buf)
+	m.Bus.CopyOut(dumpBase, buf)
 	if err := os.WriteFile(*dumpRAM, buf, 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "dumpram: %v\n", err)
 		return

@@ -11,6 +11,7 @@ const (
 
 	adcData1Status uint32 = 0x2C // APB_SARADC_1_DATA_STATUS，ADC1_DATA[16:0]
 	adcData2Status uint32 = 0x30 // APB_SARADC_2_DATA_STATUS
+	adcIntRaw      uint32 = 0x44 // 转换完成中断原始状态，bit31/30 = ADC1/ADC2 done
 
 	ADCChannelCount = 5 // C3 ADC1_CH0..CH4（对应 GPIO0..GPIO4）
 	adcMaxRaw       = 0xFFF
@@ -31,6 +32,10 @@ func (a *ADC) Read(offset uint32, size uint32) uint32 {
 	switch offset {
 	case adcData1Status:
 		return a.channels[0] & adcMaxRaw
+	case adcIntRaw:
+		// 固件启动时用阻塞式采样：写启动位后轮询 INT_RAW 的 done 位。
+		// 模拟器不建模采样时序，直接报告转换完成。
+		return 0xC0000000
 	}
 	if v, ok := a.regs[offset]; ok {
 		return v

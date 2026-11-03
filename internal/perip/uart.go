@@ -2,28 +2,49 @@ package perip
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
 	"sync"
 )
 
-// ESP32-C3 UART0 基址（技术参考手册）。
+// ESP32-C3 UART0 / UART1 基址（技术参考手册）。
 const (
 	UART0Base uint32 = 0x60000000
+	UART1Base uint32 = 0x60010000
 	UARTSize  uint32 = 0x1000
 )
 
 // UART 寄存器偏移（只实现控制台最小子集）。
 const (
-	uartFifo   uint32 = 0x00
-	uartIntRaw uint32 = 0x04
-	uartIntSt  uint32 = 0x08
-	uartIntEna uint32 = 0x0C
-	uartIntClr uint32 = 0x10
-	uartClkdiv uint32 = 0x14
-	uartStatus uint32 = 0x1C
+	uartFifo    uint32 = 0x00
+	uartIntRaw  uint32 = 0x04
+	uartIntSt   uint32 = 0x08
+	uartIntEna  uint32 = 0x0C
+	uartIntClr  uint32 = 0x10
+	uartClkdiv  uint32 = 0x14
+	uartStatus  uint32 = 0x1C
+	uartConf1   uint32 = 0x24
+	uartMemConf uint32 = 0x60
 )
+
+// UART0/UART1 中断：source 21/22 经 INTMTX 路由（TinyOS 把 UART0 取到
+// CPU line 3，IDF 自己配）。只建模控制台真正用到的两位：RX FIFO 满与接收超时。
+const (
+	uartSrc           = 21
+	uart1Src          = 22
+	uartIntRxfifoFull = 1 << 0
+	uartIntRxfifoTout = 1 << 8
+
+	uartConf1RxToutEn = 1 << 21
+)
+
+// source 返回本 UART 实例在 INTMTX 里的中断源编号。
+func (u *UART) source() uint32 {
+	if u.src != 0 {
+		return u.src
+	}
+	return uartSrc
+}
 
 // UART0：TX FIFO 写一个字节即输出到模拟器 stdout；RX 由后台协程把
 // 注入的 reader 数据搬进缓冲，FIFO 读/FIFO 状态计数都走这个缓冲，
@@ -41,6 +62,14 @@ type UART struct {
 
 	txBytes uint64 // 写进 TX FIFO 的字节数（诊断/UI）
 	rxBytes uint64 // 从 RX FIFO 被内核读走的字节数
+
+	// 中断状态：UART0 = source 21，UART1 = source 22。regs 只存
+	// INT_ENA/CONF1/MEM_CONF，tout 是接收超时锁存（写 INT_CLR 才清）。
+	intc *C3Intc
+	regs map[uint32]uint32
+	tout bool
+	name string
+	src  uint32
 }
 
 // RxFIFOMax 是硬件 RX FIFO 的深度（C3 为 128 字节）。
@@ -49,14 +78,54 @@ const RxFIFOMax = 128
 // NewUART 创建一个不接 stdin/stdout 的 UART：供控制协议（GUI）注入
 // TX 输出与 RX 输入时使用，避免后台协程抢读进程的 stdin。
 func NewUART() *UART {
-	return &UART{tx: io.Discard}
+	return &UART{tx: io.Discard, regs: make(map[uint32]uint32)}
 }
 
 // NewUART0 是 CLI 默认构造：TX 写 stdout，RX 由后台协程从 stdin 搬运。
 func NewUART0() *UART {
-	u := &UART{}
+	u := &UART{regs: make(map[uint32]uint32), name: "UART0", src: uartSrc}
 	u.SetIO(os.Stdout, os.Stdin)
 	return u
+}
+
+// NewUART1 构造 UART1：模拟器没有接第二路串口，TX 直接丢弃、没有 RX。
+// 中断 source 22（ETS_UART1_INTR_SOURCE），固件照常可以配置/查询状态。
+func NewUART1() *UART {
+	return &UART{tx: io.Discard, regs: make(map[uint32]uint32), name: "UART1", src: uart1Src}
+}
+
+// SetIntc 注入 INTMTX，用于把 RX 中断投递到 CPU。
+func (u *UART) SetIntc(i *C3Intc) { u.intc = i }
+
+// intRawLocked 计算当前 RAW 状态（调用方需持 u.mu）。
+// FULL 是电平：FIFO 里的字节数达到阈值就置位；TOUT 是锁存：收到字节后
+// 置位，直到写 INT_CLR 或 FIFO 被读空。
+func (u *UART) intRawLocked() uint32 {
+	var raw uint32
+	n := u.rxBuf.Len()
+	if thr := int(u.regs[uartConf1]) & 0x1F; n > 0 && n >= thr {
+		raw |= uartIntRxfifoFull
+	}
+	if u.tout {
+		raw |= uartIntRxfifoTout
+	}
+	return raw
+}
+
+// syncIRQ 把 RAW & ENA 折算成 INTMTX source 的电平。
+func (u *UART) syncIRQ() {
+	if u.intc == nil {
+		return
+	}
+	u.mu.Lock()
+	active := u.intRawLocked()&u.regs[uartIntEna] != 0
+	u.mu.Unlock()
+	if active {
+		u.intc.Raise(u.source())
+	} else {
+		u.intc.ClearSource(u.source())
+	}
+	u.intc.Deliver()
 }
 
 // SetSink 替换 TX 输出去向。应在模拟开始前调用。
@@ -127,7 +196,12 @@ func (u *UART) startRX(src io.Reader) {
 	}()
 }
 
-func (u *UART) Name() string { return "UART0" }
+func (u *UART) Name() string {
+	if u.name != "" {
+		return u.name
+	}
+	return "UART0"
+}
 
 // Reset 模拟芯片复位：RX FIFO 清空，但主机侧尚未送进 FIFO 的字节保留
 // （rxIn 建模的是主机那一端，复位不会把已经在路上的字符收回去）。
@@ -135,7 +209,10 @@ func (u *UART) Name() string { return "UART0" }
 func (u *UART) Reset() {
 	u.mu.Lock()
 	u.rxBuf.Reset()
+	u.tout = false
+	u.regs = make(map[uint32]uint32)
 	u.mu.Unlock()
+	u.syncIRQ()
 }
 
 // RxFeed 把最多 limit 个字节从输入缓冲搬进 RX FIFO（不超过硬件深度）。
@@ -145,15 +222,24 @@ func (u *UART) Reset() {
 // 真机上字节是沿线速陆续到达的，所以这里由主循环按 tick 分批放行，
 // 让 shell 有机会在两批之间取走一行。-rxrate 0 可关闭节流用于背压测试。
 func (u *UART) RxFeed(limit int) {
+	moved := false
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	for limit > 0 && u.rxIn.Len() > 0 && u.rxBuf.Len() < RxFIFOMax {
 		b, err := u.rxIn.ReadByte()
 		if err != nil {
 			break
 		}
 		_ = u.rxBuf.WriteByte(b)
+		moved = true
 		limit--
+	}
+	// 新字节到达即置接收超时锁存（这里不建模波特率，按“一批到达”算）。
+	if moved && u.regs[uartConf1]&uartConf1RxToutEn != 0 {
+		u.tout = true
+	}
+	u.mu.Unlock()
+	if moved {
+		u.syncIRQ()
 	}
 }
 
@@ -164,17 +250,37 @@ func (u *UART) Read(offset uint32, size uint32) uint32 {
 		b, err := u.rxBuf.ReadByte()
 		if err == nil {
 			u.rxBytes++
+			// FIFO 读空时硬件自动撤销接收超时锁存。
+			if u.rxBuf.Len() == 0 {
+				u.tout = false
+			}
 		}
 		u.mu.Unlock()
+		u.syncIRQ()
 		if err == nil {
 			return uint32(b)
 		}
 		return 0
+	case uartIntRaw:
+		u.mu.Lock()
+		v := u.intRawLocked()
+		u.mu.Unlock()
+		return v
 	case uartIntSt:
 		u.mu.Lock()
-		n := u.rxBuf.Len()
+		v := u.intRawLocked() & u.regs[uartIntEna]
 		u.mu.Unlock()
-		return uint32(n) & 0xFF // 简化：pending = 收到的字节数
+		return v
+	case uartIntEna:
+		u.mu.Lock()
+		v := u.regs[uartIntEna]
+		u.mu.Unlock()
+		return v
+	case uartConf1, uartMemConf:
+		u.mu.Lock()
+		v := u.regs[offset]
+		u.mu.Unlock()
+		return v
 	case uartStatus:
 		// TXFIFO 始终空闲（TXFIFO_CNT=0）以免 flush 死等；
 		// RXFIFO_CNT 反映缓冲里待读字节数（封顶 0x3FF）。
@@ -187,7 +293,12 @@ func (u *UART) Read(offset uint32, size uint32) uint32 {
 		}
 		return rxCnt // bit[9:0] = RXFIFO_CNT, TXFIFO_CNT(bit[25:16]) = 0
 	}
-	return 0
+	// 其余配置寄存器（CONF0/HWFC/SWFC/CLK_CONF…）只做影子，读回写入值：
+	// 固件初始化后读回配置能通过，不会被当成未实现外设。
+	u.mu.Lock()
+	v := u.regs[offset]
+	u.mu.Unlock()
+	return v
 }
 
 func (u *UART) Write(offset uint32, size uint32, val uint32) {
@@ -197,13 +308,25 @@ func (u *UART) Write(offset uint32, size uint32, val uint32) {
 		if _, err := u.tx.Write([]byte{c}); err == nil {
 			u.txBytes++
 		}
-	case uartIntEna:
-		// 影子存储，无副作用
+	case uartIntEna, uartConf1, uartMemConf, uartClkdiv:
+		// 影子存储；INT_ENA/CONF1 变化会影响 RAW，需要重新折算中断。
+		u.mu.Lock()
+		u.regs[offset] = val
+		u.mu.Unlock()
+		u.syncIRQ()
 	case uartIntClr:
-		// 清中断挂起（模拟里无操作）
-	case uartClkdiv:
-		// 波特率分频最小化，不影响字符 IO
+		// TOUT 是锁存，写 1 清零；FULL 是电平，FIFO 降低后自然消失。
+		u.mu.Lock()
+		if val&uartIntRxfifoTout != 0 {
+			u.tout = false
+		}
+		u.mu.Unlock()
+		u.syncIRQ()
 	default:
-		fmt.Fprintf(os.Stderr, "[uart] unhandled write off=0x%02X val=0x%08X\n", offset, val)
+		// 其余配置寄存器做影子存储（读回一致）。真正用到的只有上面
+		// FIFO/INT/CONF1，其余按“配置能读回”处理即可。
+		u.mu.Lock()
+		u.regs[offset] = val
+		u.mu.Unlock()
 	}
 }

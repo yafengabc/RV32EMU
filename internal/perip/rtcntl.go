@@ -35,9 +35,16 @@ package perip
 
 const (
 	RTCBase uint32 = 0x60008000
-	RTCSize uint32 = 0x1000
+	// RTC_CNTL 只占 0x60008000~0x600087FF；0x60008800 起是 eFuse 的窗口，
+	// 不能把整个 4KiB 页都圈给 RTC，否则 eFuse 会被先匹配掉。
+	RTCSize uint32 = 0x800
 
 	rtcOptions0   uint32 = 0x00
+	rtcTimeUpdate uint32 = 0x0C // 写 bit31 锁存计数器（只写位）
+	rtcTimeLo0    uint32 = 0x10
+	rtcTimeHi0    uint32 = 0x14
+	rtcTimeLo1    uint32 = 0xDC
+	rtcTimeHi1    uint32 = 0xE0
 	rtcWdtCfg0    uint32 = 0x90
 	rtcWdtCfg1    uint32 = 0x94
 	rtcWdtCfg2    uint32 = 0x98
@@ -66,6 +73,11 @@ type RTC struct {
 	// reset 记录 SW_SYS_RST 被写进来的事实：真正把机器拉回复位状态的是
 	// 外部主循环，这里只立旗。
 	reset bool
+
+	// rtcTime 是 RTC 慢时钟计数器（真机 40 位，按 150kHz 慢时钟递增）。
+	// 模拟器把 1 条指令当作 1 个慢时钟周期——与 WDT 计数的简化一致；
+	// IDF 的 rtc_init 用它做超时判断，时间不动会死循环。
+	rtcTime uint64
 
 	// RTC WDT
 	wdtCfg0   uint32
@@ -107,8 +119,14 @@ func (r *RTC) Read(offset uint32, size uint32) uint32 {
 		}
 		return v
 	}
-	if off == rtcWdtFeed {
+	if off == rtcWdtFeed || off == rtcTimeUpdate {
 		return 0
+	}
+	switch off {
+	case rtcTimeLo0, rtcTimeLo1:
+		return uint32(r.rtcTime)
+	case rtcTimeHi0, rtcTimeHi1:
+		return uint32(r.rtcTime >> 32)
 	}
 	return r.regs[off]
 }
@@ -176,6 +194,7 @@ func (r *RTC) Write(offset uint32, size uint32, val uint32) {
 // 触发整机复位；动作为 interrupt/off 时只计数不动作（模拟器没有对应的
 // RTC 中断线）。
 func (r *RTC) Tick(n uint64) {
+	r.rtcTime += n
 	if r.wdtCfg0&rtcWdtEn == 0 || r.wdtHold[0] == 0 || r.wdtReset {
 		return
 	}

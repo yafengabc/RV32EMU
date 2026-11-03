@@ -3,8 +3,9 @@ package rom
 import "rv32emu/internal/mem"
 
 // FlashBase 是 flash 模拟区在总线上的基址。ROM 读写桩把
-// (FlashBase + flash_addr) 当作物理 flash。main 必须把 ramdisk 镜像放进
-// 总线 FlashBase + 0x100000 处。与 perip.FlashEmuBase 保持一致。
+// (FlashBase + flash_addr) 当作物理 flash。ramdisk 镜像放在总线
+// FlashBase + flash 偏移处（默认 0x80000，见 soc.DefaultFlashOffset）。
+// 与 perip.FlashEmuBase 保持一致。
 const FlashBase uint32 = 0x3F000000
 
 // ROM 入口点（来自 esp-idf esp32c3.rom.ld）：
@@ -17,10 +18,12 @@ const (
 	entryConf  uint32 = 0x134
 )
 
-// 实现例程地址（放在 ROM 空闲区）。
+// 实现例程地址（放在 ROM 高地址空闲区）。
+// 不能用 0x400/0x440：ROM 符号表里 0x40000400 起是 strndup/atoi 等
+// libc 入口，桩代码会把它们覆盖掉，固件调用这些函数时会执行到错误指令。
 const (
-	implRead  uint32 = 0x400
-	implWrite uint32 = 0x440
+	implRead  uint32 = 0x7F000
+	implWrite uint32 = 0x7F100
 )
 
 // ---- 指令编码（RV32I）-------------------------------------------------

@@ -14,6 +14,8 @@ Go 实现，单核，严格对齐 ESP32-C3（RV32IMC，无 F/D 浮点，无 A �
 ```
 rv32emu/
 ├─ go.mod / main.go            CLI：-elf / -ramdisk / -trace / -step / -max
+├─ ctl.go                      -ctl 模式：stdin/stdout 上的 JSON Lines 控制协议
+├─ gui/                        图形界面（Gio）：加载镜像、UART 终端、看门狗/ADC 面板
 ├─ tools/benchrun/             计时器（与 rv32emu-c 的 -bench 同一口径）
 ├─ internal/
 │  ├─ cpu/                     CPU 核心
@@ -29,15 +31,23 @@ rv32emu/
 │  │  ├─ bus.go               Bus/Peripheral 接口
 │  │  └─ memory.go            ROM/SRAM/动态 RAM/flash 模拟区，外设整字访问
 │  ├─ perip/                   外设
-│  │  ├─ uart.go              UART0@0x60000000（FIFO↔stdout/stdin，RX 节流）
+│  │  ├─ uart.go              UART0/UART1（FIFO↔stdout/stdin，RX 中断/节流）
 │  │  ├─ gpio.go              GPIO@0x60004000
-│  │  ├─ c3.go                TIMG0 节拍源 + INTMTX + SPI1 硬件擦除
+│  │  ├─ c3.go                TIMG0 节拍源 + INTMTX 路由 + SPI0/SPI1 flash 控制器
+│  │  ├─ c3more.go            UART1 / SPI2(GP-SPI) / I2C0 + 其余寄存器影子外设
+│  │  ├─ cache.go             flash cache/XIP：EXTMEM 寄存器 + MMU 表 + DROM/IROM 窗口
+│  │  ├─ systimer.go          SYSTIMER@0x60023000（计数器 + 报警）
 │  │  ├─ usj.go               USJ@0x60043000（第二个控制台，黑洞模型）
 │  │  ├─ rtcntl.go            RTC_CNTL@0x60008000（关看门狗用，被动）
+│  │  ├─ efuse.go             eFuse@0x60008800（只读：MAC + 芯片版本）
 │  │  └─ clint.go             CLINT mtimer@0x02000000（旧路径，C3 不用）
-│  ├─ rom/rom.go              ROM 桩：esp_rom_spiflash_read/write/config_param
-│  ├─ elf/elf.go              ELF 段加载（ESP-IDF .elf 直接跑）
-│  └─ debug/disasm.go         反汇编 / 单步日志
+│  ├─ rom/                     ROM 服务桩（无真实 ROM 镜像）
+│  │  ├─ rom.go               ROM 代码区里的 flash 桩
+│  │  └─ service.go           ROM libc / printf / cache / crc 等函数按地址分派
+│  ├─ soc/                     整机装配：总线 + CPU + 外设 + flash（CLI/GUI 共用）
+│  ├─ session/                 上电会话：模拟循环 + 命令 + 事件（-ctl 与 GUI 共用）
+│  ├─ elf/elf.go               ELF 段加载（ESP-IDF .elf 直接跑）
+│  └─ debug/disasm.go          反汇编 / 单步日志
 └─ firmware/test_min/          ESP-IDF 最小测试工程
 ```
 
@@ -49,26 +59,54 @@ rv32emu/
 | SRAM | `0x3FC80000 ~ 0x3FCFFFFF` |
 | UART0 | `0x60000000` |
 | GPIO | `0x60004000` |
-| SPI1 | `0x60002000`（硬件扇区擦除） |
-| RTC_CNTL | `0x60008000` |
-| USJ | `0x60043000` |
+| SPI1 | `0x60002000`（flash 编程：硬件擦除位 + USER 模式） |
+| SPI0 | `0x60003000`（cache/flash 控制器：USER 模式读 ID/读数据） |
+| IO_MUX | `0x60009000`（寄存器影子） |
+| RTC_CNTL | `0x60008000`（窗口到 `0x600087FF`） |
+| eFuse | `0x60008800`（只读：MAC、芯片版本） |
+| RTC_I2C | `0x6000E000`（寄存器影子） |
+| UART1 | `0x60010000`（TX 丢弃，无 RX） |
+| I2C0 | `0x60013000`（命令列表模型，无外部从机） |
+| UHCI0 / RMT / LEDC | `0x60014000` / `0x60016000` / `0x60019000`（影子） |
 | TIMG0 | `0x6001F000`（节拍源） |
-| INTMTX | `0x600C2000` |
+| TIMG1 | `0x60020000`（影子） |
+| SYSTIMER | `0x60023000`（2 个 52 位计数器 + 3 个比较器） |
+| SPI2 | `0x60024000`（GP-SPI，无外部器件时环回） |
+| SYSCON | `0x60026000`（寄存器影子） |
+| TWAI / I2S0 | `0x6002B000` / `0x6002D000`（影子） |
+| AES/SHA/RSA/DS/HMAC/GDMA | `0x6003A000 ~ 0x6003F000`（影子） |
+| APB_SARADC / USJ | `0x60040000` / `0x60043000` |
+| INTMTX | `0x600C2000`（source→CPU line 路由） |
+| EXTMEM / MMU | `0x600C4000`（控制寄存器 + `0x600C5000` 起 128 项 MMU 表） |
+| SYSTEM / SENSITIVE | `0x600C0000` / `0x600C1000`（SYSTEM 的 `FROM_CPU_INTR0..2` 建模为软件中断，其余影子） |
+| AES_XTS / ASSIST_DEBUG / DEDICATED_GPIO / WORLD_CNTL | `0x600CC000 ~ 0x600D0000`（影子） |
+| DROM / IROM | `0x3C000000` / `0x42000000`（各 8 MiB XIP 窗口） |
 | flash 模拟区 | `0x3F000000 + 4 MiB`（ROM 桩把这里当物理 flash） |
 
+WiFi/BLE 相关的 NRX（`0x6001CC00`）、BB（`0x6001D000`）与 RF 前端（FE/FE2）不在
+建模范围内；对这些地址的访问仍按「读 0/写丢弃」处理并去重告警。
+
 内核镜像由 ELF 加载器按 `0x40380000` 起点铺开（C3 的指令/数据双别名在
-TinyOS 里没有用到——它是扁平链接的），ramdisk 镜像放到 flash 偏移 `0x100000`。
+TinyOS 里没有用到——它是扁平链接的），ramdisk 镜像默认放到 flash 偏移
+`0x80000`（512 KiB），可用 `-flashoff` 指定其他位置。
 
 ## 构建与运行
 
 ```powershell
 go build -o rv32emu.exe .
+go build -o rv32gui.exe .\gui     # 图形界面
 
 # 跑 ELF（ESP-IDF 编译产物）
 .\rv32emu.exe -elf build\test_min.elf
 
 # 跑 TinyOS C3（内核 + littlefs 镜像）
 .\rv32emu.exe -elf ..\TinyOS\build\kernel-esp32c3.elf -ramdisk ..\TinyOS\build\ramdisk-esp32c3.bin
+
+# 跑官方 MicroPython（整片 flash 镜像）
+.\rv32emu.exe -flashimg fw.bin
+
+# 图形界面
+.\rv32gui.exe
 ```
 
 CLI 参数（常用的）：
@@ -76,7 +114,9 @@ CLI 参数（常用的）：
 | 参数 | 作用 |
 |------|------|
 | `-elf` / `-bin` | 固件加载方式 |
-| `-ramdisk` | littlefs 分区镜像，装进 flash 模拟区 `0x100000` |
+| `-ramdisk` | littlefs 分区镜像，装进 flash 模拟区 |
+| `-flashoff` | ramdisk 在 flash 中的偏移（默认 `0x80000`，支持十进制/`0x` 十六进制） |
+| `-flashimg` | 整片 SPI flash 镜像（如 `fw.bin`）：按镜像内分区表找应用并启动 |
 | `-entry` | bin 加载基址（默认 `0x40000000`） |
 | `-max N` | 最大指令数（0=跑到停机） |
 | `-trace` / `-tracefrom` / `-traceto` | 逐条反汇编，可限定指令区间 |
@@ -90,6 +130,7 @@ CLI 参数（常用的）：
 | `-nopmp` | 关掉 U-mode 的 PMP 强制（A/B 对照） |
 | `-rxrate` / `-rxperiod` / `-rxdelay` | 控制台输入节流（见下） |
 | `-tickdiv N` | 把 tick 周期拉长 N 倍，验证时序敏感性 |
+| `-ctl` | 控制模式：stdin/stdout 走 JSON Lines，供 GUI/脚本驱动 |
 
 ### 控制台输入为什么要节流
 
@@ -144,8 +185,10 @@ CLI 参数（常用的）：
 go test ./...
 ```
 
-覆盖：UART0 字符输出、M 扩展乘除（含有符号 `-7/3`）、C 压缩指令（`c.addi`、
-`c.lwsp/c.swsp`、分支/跳转偏移）、非法指令异常 `mcause=2`。
+覆盖：UART0 字符输出与 RX 中断（FULL/TOUT/INT_CLR）、UART1、SPI2 环回与
+TRANS_DONE、I2C0 命令列表（DONE/FIFO 计数/中断）、寄存器影子读回、M 扩展乘除
+（含有符号 `-7/3`）、C 压缩指令（`c.addi`、`c.lwsp/c.swsp`、分支/跳转偏移）、
+非法指令异常 `mcause=2`。
 
 另外 `runhot_equiv_test.go` 专门盯两条执行路径的一致性：整段程序 `RunHot` 与逐条 `Step`
 的寄存器/PC 必须相同，解码出的块逐条重放也要相同；还有两条自修改代码用例，保证块缓存在
@@ -163,6 +206,30 @@ idf.py build
 ..\..\rv32emu.exe -elf build\test_min.elf
 ```
 固件直接写 UART0 FIFO 寄存器打印结果，模拟器映射到 stdout，行为与真实 C3 一致。
+
+## 跑官方 MicroPython 固件
+
+官方 ESP32-C3 固件（IDF 构建的 `ESP32_GENERIC_C3`）可以整片 flash 镜像直接启动：
+
+```powershell
+.\rv32emu.exe -flashimg fw.bin
+```
+
+- 镜像里的 bootloader / 分区表 / 应用由 Go 侧 `loadAppImage` 解析：按分区表找到
+  app，建立 IROM/DROM 的 MMU 映射，再把 RAM 段拷到目标地址，PC 直接落在 app entry。
+- 分区表校验通过：ROM 里的 `esp_rom_md5_init/update/final` 按 RFC 1321 实现
+  （此前是返回 0 的空桩，摘要恒为零导致 `Partition table MD5 mismatch` 并回退到
+  编译期默认分区表）。stderr 不再出现 `Partition table MD5 mismatch` /
+  `load_partitions returned 0x103`。
+- flash 未写入区域按擦除态 `0xFF` 初始化，LittleFS 分区因此被判定为空，首次启动
+  打印 `Performing initial setup`（格式化）。
+- 当前状态：首次启动的 `inisetup.py` 完整走通（LittleFS 格式化 → 挂载 → 创建
+  `boot.py`），随后进入 MicroPython `>>> REPL`，可交互执行代码（`import os`、`print`、
+  `os.stat('/')` 均正常）。FreeRTOS tick 由 SYSTIMER TARGET0 经 INTMTX 投递，
+  `vTaskDelay` 不再阻塞启动。WiFi/BLE 没有建模。
+  开发中定位过的两个坑：flash 状态寄存器缺 WEL 语义会让 LittleFS 报
+  `ESP_ERR_NOT_FOUND (-261)`；ROM 桩缺 `__bswapsi2` / `strspn` / `strcspn`
+  会让元数据 tag 全为 0 并报 `OSError: 84`（`LFS2_ERR_CORRUPT`）。
 
 ## 性能
 
@@ -287,26 +354,63 @@ tinygo build -target=riscv-qemu -o bench.elf .
   `pmpcfg/pmpaddr` 写入后惰性重建。
 - `mtvec` 强制按 vectored 处理（C3 硬件只支持这一种）：同步异常跳 base，中断跳
   `base + 4*cause`。
-- 中断只有 TIMG0 一条（`mcause = 0x80000002`），没有 `mie` CSR，仅由 `mstatus.MIE` 门控。
+- CSR 读写指令（`csrrw/csrrs/csrrc`）按规范先取 `rs1` 值再写 `rd`，因此
+  `csrrs a5, mstatus, a5`（rd == rs1）能正确置位 `MIE`——FreeRTOS 端口用它退出临界区。
+- 中断源：TIMG0 T0 直接上报 CPU line 2（`mcause = 0x80000002`）；SYSTIMER 的
+  TARGET0..2 经 INTMTX 路由（source 37..39）；UART0 RX（FIFO 满 / 接收超时）经
+  INTMTX 路由（source 21）；SYSTEM 的 `FROM_CPU_INTR0`（写 1 触发、写 0 清除，
+  即 esp-riscv 的软件中断 / `vPortYield`）路由到 INTMTX source 50。都按固件写入的
+  映射/优先级/阈值投递。没有 `mie` CSR，仅由 `mstatus.MIE` 门控。
 - `ebreak` 约定为停机，作为固件退出。
 
 ### 内存 / 取指
 
-- 只支持**扁平链接**的固件：从 `0x40000000` 起执行。ESP-IDF 默认把代码放在 flash 的
-  指令别名 `0x42000000`，这类镜像需要先重链接（TinyOS 就是扁平链接的）。
-- 没有 flash MMU/页映射，也没有 `0x3C000000` 数据别名；ELF 段按 paddr 直接铺进平铺区。
-- 未建模的地址：读返回 0、写丢弃，并按地址去重打印告警，便于发现新缺口。
+- 既支持**扁平链接**的固件（从 `0x40000000` 起执行），也支持 ESP-IDF 风格的
+  IROM `0x42000000` / DROM `0x3C000000` 虚地址段（经 flash cache 窗口读取）。
+- XIP 窗口的映射由 128 项 MMU 表决定，复位默认线性映射；ELF 段写进窗口时落进
+  overlay，不会改 flash 镜像。未建模地址仍按读 0/写丢弃处理并去重告警。
 - 基本块缓存以 4 KiB 页为失效粒度，单块最多 32 条指令、512 个槽；写平铺区会 bump 所在页
   的版本号，所以自修改代码和 SPI1 擦写 flash 都不会读到过期块。
 
 ### 外设
 
-- 只覆盖 TinyOS 实际用到的部分：UART0、GPIO 影子、TIMG0（T0 节拍 + TG0WDT）、
-  INTMTX（被动影子）、SPI1 扇区擦除、USJ（黑洞）、RTC_CNTL（被动）；CLINT mtimer
-  是旧路径，C3 不用。
-- **UART 接收中断没有建模**：真机上内核把 UART0 RX 中断路由到 INTMTX 的 CPU line 3，是
-  一条独立于 tick 的唤醒路径；这里 INTMTX 不会真的拉中断，输入走内核保留的 tick 轮询兜底。
-  功能不受影响，输入延迟按 tick 量化。
+- 覆盖 C3 除 WiFi/BLE 外的标准外设：UART0（含 RX 中断）、UART1（复用 UART 模型，
+  TX 丢弃、无 RX）、GPIO、TIMG0（T0 节拍 + TG0WDT）、TIMG1（影子）、SYSTIMER
+  （计数 + TARGET 报警）、INTMTX（source→CPU line 路由）、SPI1/SPI0（flash 擦写与
+  USER 模式命令）、SPI2（GP-SPI，USER 传输 + TRANS_DONE 中断）、I2C0（命令列表
+  传输，COMD DONE/TRANS_COMPLETE）、APB_SARADC（通道值注入）、flash cache/XIP（MMU +
+  DROM/IROM 窗口）、eFuse（只读 MAC/版本）、USJ（黑洞）、RTC_CNTL（被动）；
+  CLINT mtimer 是旧路径，C3 不用。
+- **寄存器影子外设**：SENSITIVE、IO_MUX、SYSCON、RTC_I2C、UHCI0、RMT、
+  LEDC、TWAI、I2S0、GDMA、AES/SHA/RSA/DS/HMAC/AES_XTS、ASSIST_DEBUG、
+  DEDICATED_GPIO、WORLD_CNTL 只保存写入值（读回一致），不产生中断、不驱动引脚，
+  也不模拟触发/完成时序。固件做初始化/读回配置能正常通过；若有固件真的轮询这些
+  模块的「完成位」，仍可能停住（目前没有固件在使用它们）。
+- **SPI2 是环回模型**：没有接外部器件，同时开 MOSI/MISO 时 W0..W15 的发送数据
+  原样作为接收数据；只开 MISO 时接收清零。`USR`/`UPDATE` 写 1 自清，
+  `DMA_INT_RAW.TRANS_DONE` 置位并可经 INTMTX source 19 投递。
+- **I2C0 是命令列表模型**：写 `CTR.TRANS_START` 后按 `COMD0..7` 执行，WRITE 消费
+  TX FIFO、READ 往 RX FIFO 填 0，每条命令置 `DONE`；同时置 TRANS_START /
+  TRANS_COMPLETE / END_DETECT 中断（source 29）。没有外部从机，因此不产生 NACK。
+- **UART1** 与 UART0 共用寄存器语义（中断 source 22），但没有接收通路，TX 字节
+  直接丢弃。
+- **flash cache/XIP**：MMU 表（128×64 KiB）按软件写入的页号翻译，复位默认线性映射
+  （窗口偏移 == flash 偏移）；ELF 的 IROM/DROM 段写进按虚拟页懒分配的 overlay，不污染
+  flash 本体。EXTMEM 控制寄存器只做影子，不按 ENABLE/SHUT 真正门控 cache——没有
+  bootloader 的裸机固件在初始化前也要能取指。
+- **cache 一致性是简化的**：SPI 擦写 flash 不会让已写入 overlay 的页失效；XIP 页不在
+  平铺区里，擦写 flash 也不会让基本块缓存失效。IROM/DROM 段只在加载时写入，正常流程不受影响。
+- **SPI0/SPI1 共用一套 SPI_MEM 模型**：硬件命令位（RDID/RDSR/SE/BE/CE/PP/READ）和
+  USER 模式都支持；USER 数据按 memcpy 语义放在 W0..W15（第 i 字节 → `W[i/4]` 的第
+  `i%4` 字节），与 IDF 实际的字节排列可能不同。flash 容量固定 4 MiB，JEDEC ID
+  `C84016`。
+- **UART0 接收中断**：模型 `INT_RAW/INT_ST/INT_ENA/INT_CLR`，`RXFIFO_FULL` 按
+  `CONF1` 阈值做电平，`RXFIFO_TOUT` 是锁存（新字节置位、写 `INT_CLR` 或读空 FIFO 清零），
+  再经 INTMTX source 21 投递。没有按波特率建模超时延迟；内核仍保留 tick 轮询兜底。
+  其余配置寄存器（`CONF0`/`HWFC`/`SWFC`/`CLK_CONF` 等）做寄存器影子，写入可读回。
+- **eFuse 只读模型**：BLK1 提供固定 MAC `AC:67:B2:12:34:56` 与晶圆版本 v0.4，
+  BLK0 的 `DIS_*` 选项位全 0（cache/JTAG/下载模式都保持可用）；编程寄存器写入丢弃。
+  固定值只影响打印和 WiFi/BT 的 MAC，不影响启动流程。
 - 因此**真机上「粘贴长命令丢字节」那类问题复现不出来**：管道没有 115200 的物理上限，
   tick 之间不会堆满 128 字节接收 FIFO。
 - 没有精确外设时序：tick 是「每 N 条指令」而不是墙钟，`-tickdiv` 用来验证时序敏感性。
@@ -329,7 +433,8 @@ tinygo build -target=riscv-qemu -o bench.elf .
 ### 与真机的已知差异（时序类）
 
 - 中断延迟按指令数而不是周期数，单条指令的「耗时」是均匀的。
-- 没有总线竞争、cache、flash 等待周期，所以对时序敏感的竞态在模拟器里更「干净」。
+- 没有总线竞争、flash 等待周期，cache 也不建模命中/失效延迟，所以对时序敏感的竞态在
+  模拟器里更「干净」。
 - 反过来，这种确定性可以用来复现竞态：TinyOS 的 `sched_switch` 丢任务 bug 就是靠
   `-tickdiv 1` 必现 + `-traplog` + `-breakpc` + `-dumpram` 定位的（TinyOS 侧已修，
   commit `dbe0e90`：把「选择任务」和「探测是否还有人等」放进同一个关中断区间）。

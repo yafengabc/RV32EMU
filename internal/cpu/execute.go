@@ -247,24 +247,28 @@ func (c *CPU) execSystem(instr, curPC uint32) {
 			c.illegal(instr)
 			return
 		}
+		// rd 与 rs1 可以是同一个寄存器，必须先把 rs1 的值取出来再写 rd。
+		src := c.Reg(r1)
 		c.setRd(rd_, v)
-		c.csr.Write(csr, c.Reg(r1))
+		c.csr.Write(csr, src)
 	case 2: // CSRRS
 		v, ok := c.csr.Read(csr)
 		if !ok {
 			c.illegal(instr)
 			return
 		}
+		src := c.Reg(r1)
 		c.setRd(rd_, v)
-		c.csr.Write(csr, v|c.Reg(r1))
+		c.csr.Write(csr, v|src)
 	case 3: // CSRRC
 		v, ok := c.csr.Read(csr)
 		if !ok {
 			c.illegal(instr)
 			return
 		}
+		src := c.Reg(r1)
 		c.setRd(rd_, v)
-		c.csr.Write(csr, v&^c.Reg(r1))
+		c.csr.Write(csr, v&^src)
 	case 5: // CSRRWI
 		v, ok := c.csr.Read(csr)
 		if !ok {

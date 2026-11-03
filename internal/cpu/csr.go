@@ -53,6 +53,11 @@ type CSRFile struct {
 	pmpaddr  [16]uint32
 	// pmpDirty 标记配置被改写，pmpCheck 首次访问时重建解析后的区间表。
 	pmpDirty bool
+
+	// custom 保存 ESP32-C3 的自定义 CSR（0x7C0~0x7FF，如 mhint/mintthresh）。
+	// 固件启动时会读写这些寄存器；精确语义不影响执行，按普通寄存器处理，
+	// 至少不能因为「未知 CSR」被当成非法指令。
+	custom [64]uint32
 }
 
 func newCSRFile() *CSRFile {
@@ -103,6 +108,9 @@ func (c *CSRFile) Read(addr uint32) (uint32, bool) {
 	if addr >= csrPmpaddr0 && addr <= csrPmpaddr15 {
 		return c.pmpaddr[addr-csrPmpaddr0], true
 	}
+	if addr >= 0x7C0 && addr <= 0x7FF {
+		return c.custom[addr-0x7C0], true
+	}
 	return 0, false
 }
 
@@ -137,6 +145,10 @@ func (c *CSRFile) Write(addr uint32, val uint32) bool {
 		if addr >= csrPmpaddr0 && addr <= csrPmpaddr15 {
 			c.pmpaddr[addr-csrPmpaddr0] = val
 			c.pmpDirty = true
+			return true
+		}
+		if addr >= 0x7C0 && addr <= 0x7FF {
+			c.custom[addr-0x7C0] = val
 			return true
 		}
 		return false

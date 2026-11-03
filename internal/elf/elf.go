@@ -48,10 +48,13 @@ func Load(path string, bus *mem.SystemBus) (uint32, error) {
 		if bus.RamSizeAt(s.base) > 0 {
 			continue // 已有 RAM
 		}
+		if bus.HasDeviceAt(s.base) {
+			continue // 已挂外设（如 IROM/DROM 的 XIP 窗口）
+		}
 		// 找连续段范围
 		lo, hi := s.base, s.end
 		for _, s2 := range segs {
-			if s2.base >= lo && s2.base <= hi && !inBuiltin(s2.base) {
+			if s2.base >= lo && s2.base <= hi && !inBuiltin(s2.base) && !bus.HasDeviceAt(s2.base) {
 				if s2.end > hi {
 					hi = s2.end
 				}
