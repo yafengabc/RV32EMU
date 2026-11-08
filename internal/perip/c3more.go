@@ -358,7 +358,10 @@ type C3Sys struct {
 }
 
 func NewC3Sys(intc *C3Intc) *C3Sys {
-	return &C3Sys{regs: make(map[uint32]uint32), intc: intc}
+	return &C3Sys{regs: map[uint32]uint32{
+		0x00: 0x00000040, // CPU_PER_CONF: PLL/6, 480 MHz VCO
+		0x58: 0x000a8001, // SYSCLK_CONF: XTAL, /2 (the ROM's 20 MHz state)
+	}, intc: intc}
 }
 
 func (s *C3Sys) Name() string { return "SYSTEM" }

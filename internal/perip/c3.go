@@ -37,14 +37,16 @@ const (
 // ---- TIMG0（节拍源）---------------------------------------------------
 
 type C3Timer struct {
-	cpu     *cpu.CPU
-	intc    *C3Intc
-	counter uint64
-	reload  uint32
-	fires   uint64 // 定时器触发次数（诊断用）
-	div     uint32 // 计数分频：>1 时每 div 条指令才计一次（调 tick 周期用）
-	sub     uint32
-	regs    map[uint32]uint32
+	cpu      *cpu.CPU
+	intc     *C3Intc
+	counter  uint64
+	reload   uint32
+	fires    uint64 // 定时器触发次数（诊断用）
+	div      uint32 // 计数分频：>1 时每 div 条指令才计一次（调 tick 周期用）
+	guestDiv uint32 // TIMG0 T0_DIVIDER：APB / guestDiv = 1 MHz 计数
+	sub      uint32
+	t0Sub    uint32
+	regs     map[uint32]uint32
 
 	// TG0WDT（TIMG0 看门狗）。真机上 ROM 交出来时它是开着的，但本模拟器
 	// 的 ROM 是手写桩、没有那段初始化，所以上电默认关闭；固件要按真机
@@ -125,6 +127,15 @@ func (t *C3Timer) TickN(n uint64) {
 		}
 	}
 	t.tickWDT(n)
+
+	/* T0 runs from APB/guestDiv (the C3 platform writes 80 for 1 MHz at
+	 * 80 MHz APB); the watchdog above has its own prescaler and must see
+	 * the un-divided APB cycles. */
+	if t.guestDiv > 1 {
+		total := uint64(t.t0Sub) + n
+		n = total / uint64(t.guestDiv)
+		t.t0Sub = uint32(total % uint64(t.guestDiv))
+	}
 	// T0 只有被固件真正布防（CONFIG0 的 EN + ALARM_EN 都置位）才会产生
 	// 报警中断。真机复位后 T0 是关的；ESP-IDF 在 C3 上用 SYSTIMER 做
 	// FreeRTOS tick，根本不碰 TIMG0 T0，所以这里不能凭空造 tick——
@@ -356,6 +367,14 @@ func (t *C3Timer) Write(offset uint32, size uint32, val uint32) {
 	switch offset {
 	case t0ConfigReg:
 		t.regs[offset] = val
+		/* T0_DIVIDER is the APB-to-timer divisor itself: the C3 platform
+		 * writes 80 at 80 MHz APB to get a 1 MHz count rate.  Zero means
+		 * 65536, per the register definition. */
+		d := (val >> t0DivS) & t0DivM
+		if d == 0 {
+			d = 0x10000
+		}
+		t.guestDiv = d
 		if val&t0En != 0 {
 			t.counter = 0 // 使能即重启动计数器
 		}

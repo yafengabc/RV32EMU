@@ -47,6 +47,7 @@ const (
 	romCacheLineSize    uint32 = 0x400004b0
 	romBootCacheInit    uint32 = 0x400004c8
 	romCacheInval       uint32 = 0x400004d4
+	romCacheInvalAll    uint32 = 0x400004d8
 	romCacheDisable     uint32 = 0x4000051c
 	romCacheEnable      uint32 = 0x40000520
 	romCacheSuspend     uint32 = 0x40000524
@@ -76,6 +77,10 @@ const (
 	romMD5Init          uint32 = 0x40000614
 	romMD5Update        uint32 = 0x40000618
 	romMD5Final         uint32 = 0x4000061c
+	romI2CRead          uint32 = 0x40001954
+	romI2CReadMask      uint32 = 0x40001958
+	romI2CWrite         uint32 = 0x4000195c
+	romI2CWriteMask     uint32 = 0x40001960
 	romCRC32Le          uint32 = 0x40000628
 	romCRC32Be          uint32 = 0x4000062c
 	romCRC16Le          uint32 = 0x40000630
@@ -84,10 +89,6 @@ const (
 	romCRC8Be           uint32 = 0x4000063c
 	romEfuseSpiConfig   uint32 = 0x4000071c
 	romEfuseWPPad       uint32 = 0x4000072c
-	romI2CRead          uint32 = 0x40001954
-	romI2CReadMask      uint32 = 0x40001958
-	romI2CWrite         uint32 = 0x4000195c
-	romI2CWriteMask     uint32 = 0x40001960
 
 	// libgcc 软整数辅助（RISC-V 无硬件 64 位乘除，固件会直接引用 ROM 实现）。
 	romAddDF3      uint32 = 0x4000076c
@@ -189,6 +190,7 @@ type Service struct {
 
 	ticksPerUs uint32
 	xtalDiv    uint32
+	bbpll      [256]byte
 	unknown    map[uint32]bool
 }
 
@@ -287,6 +289,84 @@ func (s *Service) readCString(a uint32, max int) []byte {
 	return out
 }
 
+// ---- BBPLL / clock tree -------------------------------------------------
+
+// The C3's PLL is not memory-mapped: the clock init reaches it over the
+// RTC's internal I2C bus through rom_i2c_* (block 0x66, host 0, one byte
+// per register).  Modelling that tiny file is what lets the guest see a
+// locked PLL and move the CPU mux to 160 MHz instead of staying at the
+// ROM's 20 MHz XTAL/2 state.
+const (
+	bbpllBlock  = 0x66
+	bbpllHost   = 0
+	bbpllOcDiv  = 3
+	bbpllOrLock = 8
+	bbpllLock   = 0x80
+)
+
+func (s *Service) bbpllWrite(block, host, reg, val uint32) {
+	if block != bbpllBlock || host != bbpllHost {
+		return
+	}
+	s.bbpll[reg&0xFF] = byte(val)
+}
+
+func (s *Service) bbpllWriteMask(block, host, reg, msb, lsb, val uint32) {
+	if block != bbpllBlock || host != bbpllHost || msb < lsb || msb > 7 {
+		return
+	}
+	mask := ((uint32(1) << (msb - lsb + 1)) - 1) << lsb
+	cur := uint32(s.bbpll[reg&0xFF])
+	s.bbpll[reg&0xFF] = byte((cur &^ mask) | ((val << lsb) & mask))
+}
+
+func (s *Service) bbpllRead(block, host, reg uint32) uint32 {
+	if block != bbpllBlock || host != bbpllHost {
+		return 0
+	}
+	/* OR_LOCK is a consequence of calibration, not a register the guest
+	 * writes: report it once the loop divider has been programmed, which
+	 * is the last step before a real chip locks. */
+	if reg&0xFF == bbpllOrLock && s.bbpll[bbpllOcDiv] != 0 {
+		return uint32(s.bbpll[reg&0xFF]) | bbpllLock
+	}
+	return uint32(s.bbpll[reg&0xFF])
+}
+
+// cpuHz mirrors rv32emu-c's c3clk_cpu_hz(): derive the core rate from the
+// SYSTEM clock mux the guest programmed.  Reset state is XTAL/2 = 20 MHz;
+// after the PLL path it is 160 MHz.
+func (s *Service) cpuHz() uint32 {
+	sysclk := s.bus.Read(perip.SYSTEMBase+0x58, 4)
+	per := s.bus.Read(perip.SYSTEMBase+0x00, 4)
+	sel := (sysclk >> 10) & 3
+	pre := (sysclk & 0x3FF) + 1
+
+	if sel == 1 {
+		vco := uint32(320000000)
+		if per&4 != 0 {
+			vco = 480000000
+		}
+		div := uint32(6)
+		if per&3 == 1 {
+			div = 3
+		}
+		return vco / div
+	}
+	if sel == 2 {
+		return 17500000 // RC_FAST
+	}
+	return 40000000 / pre // XTAL
+}
+
+func (s *Service) apbHz() uint32 {
+	cpu := s.cpuHz()
+	if cpu >= 80000000 {
+		return cpu / 2
+	}
+	return cpu
+}
+
 // Call 按地址分派一个 ROM 调用。未知地址返回 0 并在首次出现时告警。
 func (s *Service) Call(c *cpu.CPU, addr uint32) {
 	switch addr {
@@ -323,17 +403,16 @@ func (s *Service) Call(c *cpu.CPU, addr uint32) {
 		s.ret(c, 0)
 	case romCacheLineSize:
 		s.ret(c, 32)
-	case romBootCacheInit, romCacheInval, romCacheDisable, romCacheEnable,
-		romCacheSuspend, romCacheResume, romCacheFreezeOn, romCacheFreezeOff,
-		romCacheIDROMSize:
+	case romBootCacheInit, romCacheInval, romCacheInvalAll, romCacheDisable,
+		romCacheEnable, romCacheSuspend, romCacheResume, romCacheFreezeOn,
+		romCacheFreezeOff, romCacheIDROMSize:
 		s.ret(c, 0)
 	case romGetCpuFreq:
-		s.ret(c, s.ticksPerUs)
+		s.ret(c, s.cpuHz()/1000000)
 	case romSetCpuFreq:
-		s.ticksPerUs = s.arg(c, 0)
 		s.ret(c, 0)
 	case romGetApbFreq:
-		s.ret(c, s.ticksPerUs)
+		s.ret(c, s.apbHz()/1000000)
 	case romGetXtalFreq:
 		s.ret(c, 40)
 	case romGetXtalDiv:
@@ -411,7 +490,22 @@ func (s *Service) Call(c *cpu.CPU, addr uint32) {
 		s.ret(c, 0)
 	case romEfuseWPPad:
 		s.ret(c, 0xFFFFFFFF)
-	case romI2CRead, romI2CReadMask, romI2CWrite, romI2CWriteMask:
+	case romI2CRead:
+		s.ret(c, s.bbpllRead(s.arg(c, 0), s.arg(c, 1), s.arg(c, 2)))
+	case romI2CReadMask:
+		msb, lsb := s.arg(c, 3), s.arg(c, 4)
+		v := s.bbpllRead(s.arg(c, 0), s.arg(c, 1), s.arg(c, 2))
+		if msb >= lsb && msb <= 7 {
+			s.ret(c, (v>>lsb)&((uint32(1)<<(msb-lsb+1))-1))
+		} else {
+			s.ret(c, 0)
+		}
+	case romI2CWrite:
+		s.bbpllWrite(s.arg(c, 0), s.arg(c, 1), s.arg(c, 2), s.arg(c, 3))
+		s.ret(c, 0)
+	case romI2CWriteMask:
+		s.bbpllWriteMask(s.arg(c, 0), s.arg(c, 1), s.arg(c, 2),
+			s.arg(c, 3), s.arg(c, 4), s.arg(c, 5))
 		s.ret(c, 0)
 
 	// ---- libgcc 软整数 / 软浮点 --------------------------------------
