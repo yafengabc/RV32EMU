@@ -31,14 +31,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwayland-dev libxkbcommon-dev libx11-dev libx11-xcb-dev \
-            libxkbcommon-x11-dev libgles2-mesa-dev libegl1-mesa-dev
+            libxkbcommon-x11-dev libgles2-mesa-dev libegl1-mesa-dev \
+            libvulkan-dev
+      # firmware/ is ESP-IDF device firmware (package main, fixed MMIO address
+      # through unsafe.Pointer); it cannot run on the host, and vet is right to
+      # flag that idiom.  Everything else is host code and is checked.
       - name: Vet
-        run: go vet ./...
+        run: go vet $(go list ./... | grep -v '^rv32emu/firmware/')
       # cpu/mem/perip carry the semantics tests (RunHot vs Step equivalence,
       # C extension, self-modifying code); gui's are pure logic and do not
       # need a display.
       - name: Test
-        run: go test ./...
+        run: go test $(go list ./... | grep -v '^rv32emu/firmware/')
 
   build:
     name: ${{ matrix.name }}
