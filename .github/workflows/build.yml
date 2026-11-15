@@ -53,11 +53,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The artifact name and the file name are the same on purpose: the
+        # release step copies every artifact into one directory, so two builds
+        # called rv32emu would overwrite each other there (they did).
         include:
-          - { name: rv32emu-linux-amd64,   goos: linux,   goarch: amd64, out: rv32emu }
-          - { name: rv32emu-linux-arm64,   goos: linux,   goarch: arm64, out: rv32emu }
-          - { name: rv32emu-windows-amd64, goos: windows, goarch: amd64, out: rv32emu.exe }
-          - { name: rv32emu-darwin-arm64,  goos: darwin,  goarch: arm64, out: rv32emu }
+          - { name: rv32emu-linux-amd64,   goos: linux,   goarch: amd64, out: rv32emu-linux-amd64 }
+          - { name: rv32emu-linux-arm64,   goos: linux,   goarch: arm64, out: rv32emu-linux-arm64 }
+          - { name: rv32emu-windows-amd64, goos: windows, goarch: amd64, out: rv32emu-windows-amd64.exe }
+          - { name: rv32emu-darwin-arm64,  goos: darwin,  goarch: arm64, out: rv32emu-darwin-arm64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
