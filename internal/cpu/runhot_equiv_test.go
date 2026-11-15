@@ -167,6 +167,28 @@ func TestBlockCacheSeesSelfModifyingCode(t *testing.T) {
 	}
 }
 
+// TestBlockCacheSeesStoreSlowPath 覆盖慢路径的直写：CPU.store() 把字节写进
+// 平铺区时同样要让该页的块失效。内核（M-mode）把新程序 memcpy 进用户窗口时
+// 走的就是这里——漏掉这一步时，RunHot 会继续执行上一个程序解码出来的块，
+// 第二个用户程序一开始就撞 illegal instruction（TinyOS 的 `uptime` 后接
+// `ls /` 可稳定复现，Step 路径正常）。
+func TestBlockCacheSeesStoreSlowPath(t *testing.T) {
+	bus := mem.NewSystemBus()
+	c := New(bus)
+	code := append(words(encI(1, 0, 0, 3, 0x13)), 0x73, 0x00, 0x10, 0x00) // addi x3,x0,1; ebreak
+	bus.LoadROM(0, code)
+	c.SetPC(mem.ROMBase)
+	if n := c.RunHot(1); n != 1 || c.Reg(3) != 1 {
+		t.Fatalf("first run: n=%d x3=%d", n, c.Reg(3))
+	}
+	// 慢路径写：模拟内核把新指令拷进已经执行过的代码页。
+	c.store(mem.ROMBase, 4, encI(7, 0, 0, 3, 0x13))
+	c.SetPC(mem.ROMBase)
+	if n := c.RunHot(1); n != 1 || c.Reg(3) != 7 {
+		t.Fatalf("after store(): n=%d x3=%d (stale block?)", n, c.Reg(3))
+	}
+}
+
 // TestBlockCacheSelfModifyFromCPU 验证块内的 store 直写平铺区同样会让
 // 该页的块失效（CPU 直写路径绕过了总线的 FastWrite）。
 func TestBlockCacheSelfModifyFromCPU(t *testing.T) {

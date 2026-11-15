@@ -86,7 +86,16 @@ func ensureRAM(bus *mem.SystemBus, addr, size uint32) {
 func loadAppImage(flash []byte, bus *mem.SystemBus, mmu *perip.FlashMMU) (uint32, error) {
 	appOff, err := findAppPartition(flash)
 	if err != nil {
-		return 0, err
+		// No partition table: the image may be a direct-boot app, i.e. an ESP
+		// image at offset 0 that the boot ROM loads by itself.  TinyOS on the
+		// C3 is packed that way (kernel at 0x0, littlefs at -flashoff), and it
+		// is the one-piece image a user flashes with a single write.
+		if uint32(len(flash)) > imageHeaderSize && flash[0] == 0xE9 {
+			fmt.Printf("[image] no partition table: booting the app at 0x0 directly\n")
+			appOff = 0
+		} else {
+			return 0, err
+		}
 	}
 	if appOff+imageHeaderSize > uint32(len(flash)) {
 		return 0, fmt.Errorf("app partition @0x%X 超出 flash 大小", appOff)
