@@ -24,15 +24,17 @@ jobs:
         with:
           go-version: stable
           cache: true
-      # gui/ builds against Gio, which needs the X11/Wayland/GL headers even
-      # for `go vet`; without them ./... stops at the first cgo package.
+      # gui/ builds against Gio, which cgo-compiles against the windowing and
+      # GL stack even for `go vet`; this is Gio's documented Debian/Ubuntu set
+      # plus libvulkan-dev for its Vulkan backend.
       - name: Install GUI build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwayland-dev libxkbcommon-dev libx11-dev libx11-xcb-dev \
+          sudo apt-get install -y gcc pkg-config libffi-dev \
+            libwayland-dev libx11-dev libx11-xcb-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libgles2-mesa-dev libegl1-mesa-dev \
-            libvulkan-dev
+            libxcursor-dev libxrandr-dev libxfixes-dev libxi-dev \
+            libxinerama-dev libxxf86vm-dev libvulkan-dev
       # firmware/ is ESP-IDF device firmware (package main, fixed MMIO address
       # through unsafe.Pointer); it cannot run on the host, and vet is right to
       # flag that idiom.  Everything else is host code and is checked.
