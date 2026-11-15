@@ -109,6 +109,9 @@ jobs:
           mkdir -p assets
           find dist -type f -exec cp {} assets/ \;
           ls -l assets
-          gh release create "$TAG" assets/* \
-            --title "RV32EMU $TAG" \
-            --generate-notes
+          # Re-running a tag (a forced tag update, or a retry) must replace the
+          # assets rather than fail on "release already exists".
+          if ! gh release create "$TAG" assets/* \
+                 --title "RV32EMU $TAG" --generate-notes; then
+            gh release upload "$TAG" assets/* --clobber
+          fi
