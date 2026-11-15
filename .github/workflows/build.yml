@@ -24,6 +24,14 @@ jobs:
         with:
           go-version: stable
           cache: true
+      # gui/ builds against Gio, which needs the X11/Wayland/GL headers even
+      # for `go vet`; without them ./... stops at the first cgo package.
+      - name: Install GUI build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libx11-dev libx11-xcb-dev \
+            libxkbcommon-x11-dev libgles2-mesa-dev libegl1-mesa-dev
       - name: Vet
         run: go vet ./...
       # cpu/mem/perip carry the semantics tests (RunHot vs Step equivalence,
